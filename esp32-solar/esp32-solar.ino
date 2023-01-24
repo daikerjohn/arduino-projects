@@ -20,13 +20,23 @@ To do:
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
+#include <Preferences.h>
+
+#include <WebServer.h>
+#include <Update.h>
+#include "time.h"
+//#include <TimeLib.h>
 
 // https://github.com/syvic/ModbusMaster
 #include <ModbusMaster.h>
 ModbusMaster node;
 
+const char compile_date[] = __DATE__ " " __TIME__;
+
+Preferences prefs;
+
 // Set web server port number to 80
-WiFiServer server(80);
+WebServer server(80);
 // Variable to store the HTTP request
 String header;
 String status_str = "";
@@ -34,15 +44,19 @@ String status_str = "";
 WiFiClientSecure client;  // or WiFiClientSecure for HTTPS
 HTTPClient http;
 
+bool flashing_ota = false;
+
 const char* ssid = "dirker";
 const char* password = "alphabit";
 
 //Your Domain name with URL path or IP address with path
 const char* serverName = "https://lhbqdvca46.execute-api.us-west-2.amazonaws.com/dev/solar";
 
+unsigned long currentMillis = 0;
 // the following variables are unsigned longs because the time, measured in
 // milliseconds, will quickly become a bigger number than can be stored in an int.
 unsigned long lastTime = 0;
+unsigned long lastWebTime = 0;
 // Timer set to 10 minutes (600000)
 //unsigned long timerDelayMS = 600000;
 // Set timer to 5 seconds (5000)
@@ -50,6 +64,8 @@ unsigned long lastTime = 0;
 // Set timer to 60 seconds (60000)
 unsigned long timerDelayMS = 60000;
 
+unsigned long previousMillis = 0;        // will store last time LED was updated
+const long interval = 6000;           // interval at which to blink (milliseconds)
 
 /*
 A note about which pins to use: 
@@ -128,17 +144,23 @@ Controller_info renogy_info;
 bool simulator_mode = false;
 
 int battery_voltage = 12;
-int battery_capacity_ah = 20;
+int batt_cap_ah = 40;
 float max_battery_discharge = .5;
 
 float minimum_shutoff_voltage = 11.5;
 float minimum_starting_voltage = 12.5;
 
+int batt_soc_min = 50;
+int batt_soc_start = 65;
+
+// 5 minutes
+const long shutdown_cooldown_ms = 300000;
+// Prevent any automatic power-on for 120 seconds
+long next_available_startup = millis() + 120000;
+
+
 float sim_starting_battery_voltage = 13.12;
 float sim_bat_volt_change = -0.11;
-
-float minimum_shutoff_soc = 45;
-float minimum_starting_soc = 55;
 
 uint8_t sim_starting_battery_soc = 51.5;
 float sim_bat_soc_change = -1;
@@ -154,6 +176,13 @@ void setup()
   Serial.begin(115200);
   Serial.println("Started!");
 
+  prefs.begin("solar-app", false);
+  batt_cap_ah = prefs.getInt("batt_cap_ah", 50);
+  batt_soc_min = prefs.getInt("batt_soc_min", 50);
+  batt_soc_start = prefs.getInt("batt_soc_start", 65);
+  // Close the Preferences
+  prefs.end();
+
     WiFi.begin(ssid, password);
     //WiFi.begin("Wokwi-GUEST", "", 6);
     while (WiFi.status() != WL_CONNECTED) {
@@ -165,6 +194,8 @@ void setup()
     Serial.println("WiFi connected");
     Serial.print("IP address: ");
     Serial.println(WiFi.localIP());
+
+    configTime(0, 0, "pool.ntp.org");
 
     client.setInsecure();
 
@@ -178,6 +209,8 @@ void setup()
 
   // Start webserver
   server.begin();
+
+  delay(500);
 }
 
 void AppendStatus(String asdf) {
@@ -227,138 +260,349 @@ String structToString(struct Controller_data myData){
 }
 
 // Current time
-unsigned long currentTime = millis();
+//unsigned long currentTime = millis();
 // Previous time
-unsigned long previousTime = 0;
+//unsigned long previousTime = 0;
 // Define timeout time in milliseconds (example: 2000ms = 2s)
-const long timeoutTime = 2000;
+//const long timeoutTime = 2000;
 
 String automatic_decision = "";
 
-void handle_webserver_connection() {
-  WiFiClient one_client = server.available();   // Listen for incoming clients
 
-  if (one_client) {                             // If a new client connects,
+String statsIndex() {
+  String data = "";
+  // Display the HTML web page
+  data += "<!DOCTYPE html><html>";
+  data += "<head><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">";
+  data += "<link rel=\"icon\" href=\"data:,\">";
+  // CSS to style the on/off buttons 
+  // Feel free to change the background-color and font-size attributes to fit your preferences
+  data += "<style>html { font-family: Helvetica; display: inline-block; margin: 0px auto; text-align: center;}";
+  data += ".button { background-color: #4CAF50; border: none; color: white; padding: 16px 40px;";
+  data += "text-decoration: none; font-size: 30px; margin: 2px; cursor: pointer;}";
+  data += ".button2 {background-color: #555555;}</style>";
+
+  data += "<script>";
+  data += "setTimeout(function(){ window.location.reload(); }, 15000);";
+  data += "</script>";
+
+  data += "</head>";
+  
+  // Web Page Heading
+  data += "<body><h1>ESP32 Web Server - With OTAv3</h1>";
+  data += "<p>Compiled: " + String(compile_date) + "</p>";
+  
+  // Display current state of the Renogy load
+  if(load_running) {
+    data += "<p>Renogy Load - Running @ " + String(renogy_data.load_watts) + " watts</p>";
+  } else {
+    data += "<p>Renogy Load - Stopped - " + String(renogy_data.load_watts) + "</p>";
+  }
+  data += "<p>Last Automatic: " + String(automatic_decision) + "</p>";
+  data += "<p>" + String(status_str) + "</p>";
+  // If the load_running is on, it displays the OFF button
+  if (load_running) {
+    data += "<p><a href=\"/load/off\"><button class=\"button button2\">OFF</button></a></p>";
+  } else {
+    data += "<p><a href=\"/load/on\"><button class=\"button\">ON</button></a></p>";
+  }
+
+  data += "<form action=\"/set\">      Enter an batt_cap_ah: <input type=\"text\" name=\"batt_cap_ah\" value=\"" + String(batt_cap_ah) + "\"><br/>";
+  data += "<form action=\"/set\">      Enter an batt_soc_min: <input type=\"text\" name=\"batt_soc_min\" value=\"" + String(batt_soc_min) + "\"><br/>";
+  data += "<form action=\"/set\">      Enter an batt_soc_start: <input type=\"text\" name=\"batt_soc_start\" value=\"" + String(batt_soc_start) + "\"><br/>";
+  data += "<input type=\"submit\" value=\"Submit\"></form>";
+
+  data += "</body></html>";
+  return data;
+}
+
+const char* loginIndex = 
+ "<form name='loginForm'>"
+    "<table width='20%' bgcolor='A09F9F' align='center'>"
+        "<tr>"
+            "<td colspan=2>"
+                "<center><font size=4><b>ESP32 Login Page</b></font></center>"
+                "<br>"
+            "</td>"
+            "<br>"
+            "<br>"
+        "</tr>"
+        "<td>Username:</td>"
+        "<td><input type='text' size=25 name='userid'><br></td>"
+        "</tr>"
+        "<br>"
+        "<br>"
+        "<tr>"
+            "<td>Password:</td>"
+            "<td><input type='Password' size=25 name='pwd'><br></td>"
+            "<br>"
+            "<br>"
+        "</tr>"
+        "<tr>"
+            "<td><input type='submit' onclick='check(this.form)' value='Login'></td>"
+        "</tr>"
+    "</table>"
+"</form>"
+"<script>"
+    "function check(form)"
+    "{"
+    "if(form.userid.value=='admin' && form.pwd.value=='admin')"
+    "{"
+    "window.open('/serverIndex')"
+    "}"
+    "else"
+    "{"
+    " alert('Error Password or Username')/*displays error message*/"
+    "}"
+    "}"
+"</script>";
+ 
+/*
+ * Server Index Page
+ */
+ 
+const char* serverIndex = 
+"<script src='https://ajax.googleapis.com/ajax/libs/jquery/3.2.1/jquery.min.js'></script>"
+"<form method='POST' action='#' enctype='multipart/form-data' id='upload_form'>"
+   "<input type='file' name='update'>"
+        "<input type='submit' value='Update'>"
+    "</form>"
+ "<div id='prg'>progress: 0%</div>"
+ "<script>"
+  "$('form').submit(function(e){"
+  "e.preventDefault();"
+  "var form = $('#upload_form')[0];"
+  "var data = new FormData(form);"
+  " $.ajax({"
+  "url: '/update',"
+  "type: 'POST',"
+  "data: data,"
+  "contentType: false,"
+  "processData:false,"
+  "xhr: function() {"
+  "var xhr = new window.XMLHttpRequest();"
+  "xhr.upload.addEventListener('progress', function(evt) {"
+  "if (evt.lengthComputable) {"
+  "var per = evt.loaded / evt.total;"
+  "$('#prg').html('progress: ' + Math.round(per*100) + '%');"
+  "}"
+  "}, false);"
+  "return xhr;"
+  "},"
+  "success:function(d, s) {"
+  "console.log('success!')" 
+ "},"
+ "error: function (a, b, c) {"
+ "}"
+ "});"
+ "});"
+ "</script>";
+
+
+void handle_webserver_connection() {
+  //Serial.println("Before handleClient()");
+  server.handleClient();
+  //Serial.println("After handleClient()");
+
+  /*return index page which is stored in serverIndex */
+  server.on("/", HTTP_GET, []() {
+    //harvest_data();
+    update_decisions();
+    server.sendHeader("Connection", "close");
+    server.send(200, "text/html", statsIndex());
+  });
+  server.on("/new", HTTP_GET, []() {
     harvest_data();
     update_decisions();
+    server.sendHeader("Connection", "close");
+    server.send(200, "text/html", statsIndex());
+  });
+  server.on("/load/on", HTTP_GET, []() {
+    Serial.println("Turn load on");
+    renogy_control_load(1);
+    load_running = true;
+    server.sendHeader("Location", "/new", true);
+    server.send(302, "text/plain", "");
+    //server.redirect("/new");
+    //server.sendHeader("Connection", "close");
+    //server.send(200, "text/html", statsIndex());
+  });
+  server.on("/load/off", HTTP_GET, []() {
+    Serial.println("Turn load off");
+    renogy_control_load(0);
+    load_running = false;
+    next_available_startup = millis() + shutdown_cooldown_ms;
+    server.sendHeader("Location", "/new", true);
+    server.send(302, "text/plain", "");
+    //server.sendHeader("Connection", "close");
+    //server.send(200, "text/html", statsIndex());
+  });
 
-    currentTime = millis();
-    previousTime = currentTime;
-    Serial.println("New Client.");          // print a message out in the serial port
-    String currentLine = "";                // make a String to hold incoming data from the client
-    while (one_client.connected() && currentTime - previousTime <= timeoutTime) {  // loop while the client's connected
-      currentTime = millis();
-      if (one_client.available()) {             // if there's bytes to read from the one_cclientlient,
-        char c = one_client.read();             // read a byte, then
-        Serial.write(c);                    // print it out the serial monitor
-        header += c;
-        if (c == '\n') {                    // if the byte is a newline character
-          // if the current line is blank, you got two newline characters in a row.
-          // that's the end of the one_client HTTP request, so send a response:
-          if (currentLine.length() == 0) {
-            // HTTP headers always start with a response code (e.g. HTTP/1.1 200 OK)
-            // and a content-type so the one_client knows what's coming, then a blank line:
-            one_client.println("HTTP/1.1 200 OK");
-            one_client.println("Content-type:text/html");
-            one_client.println("Connection: close");
-            one_client.println();
-            
-            // turns the GPIOs on and off
-            if (header.indexOf("GET /load/on") >= 0) {
-              Serial.println("Turn load on");
-              renogy_control_load(1);
-              load_running = true;
-              //digitalWrite(output26, HIGH);
-            } else if (header.indexOf("GET /load/off") >= 0) {
-              Serial.println("Turn load off");
-              renogy_control_load(0);
-              load_running = false;
-              //digitalWrite(output26, LOW);
-            }
-            
-            // Display the HTML web page
-            one_client.println("<!DOCTYPE html><html>");
-            one_client.println("<head><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">");
-            one_client.println("<link rel=\"icon\" href=\"data:,\">");
-            // CSS to style the on/off buttons 
-            // Feel free to change the background-color and font-size attributes to fit your preferences
-            one_client.println("<style>html { font-family: Helvetica; display: inline-block; margin: 0px auto; text-align: center;}");
-            one_client.println(".button { background-color: #4CAF50; border: none; color: white; padding: 16px 40px;");
-            one_client.println("text-decoration: none; font-size: 30px; margin: 2px; cursor: pointer;}");
-            one_client.println(".button2 {background-color: #555555;}</style></head>");
-            
-            // Web Page Heading
-            one_client.println("<body><h1>ESP32 Web Server</h1>");
-            
-            // Display current state of the Renogy load
-            if(load_running) {
-              one_client.println("<p>Renogy Load - Running @ " + String(renogy_data.load_watts) + " watts</p>");
-            } else {
-              one_client.println("<p>Renogy Load - Stopped - " + String(renogy_data.load_watts) + "</p>");
-            }
-            one_client.println("<p>Last Automatic: " + String(automatic_decision) + "</p>");
-            one_client.println("<p>" + String(status_str) + "</p>");
-            // If the load_running is on, it displays the OFF button
-            if (load_running) {
-              one_client.println("<p><a href=\"/load/off\"><button class=\"button button2\">OFF</button></a></p>");
-            } else {
-              one_client.println("<p><a href=\"/load/on\"><button class=\"button\">ON</button></a></p>");
-            } 
-
-            one_client.println("</body></html>");
-            
-            // The HTTP response ends with another blank line
-            one_client.println();
-            // Break out of the while loop
-            break;
-          } else { // if you got a newline, then clear currentLine
-            currentLine = "";
-          }
-        } else if (c != '\r') {  // if you got anything else but a carriage return character,
-          currentLine += c;      // add it to the end of the currentLine
+  server.on("/set", HTTP_GET, []() {
+    int new_value;
+    String input_value;
+    if (server.hasArg("batt_cap_ah") || server.hasArg("batt_soc_min") || server.hasArg("batt_soc_start")) {
+      if(prefs.begin("solar-app", false)) {
+        if (server.hasArg("batt_cap_ah")) {
+          input_value = server.arg("batt_cap_ah");
+          batt_cap_ah = input_value.toInt();
+          prefs.putInt("batt_cap_ah", batt_cap_ah);
         }
+        if (server.hasArg("batt_soc_min")) {
+          input_value = server.arg("batt_soc_min");
+          batt_soc_min = input_value.toInt();
+          prefs.putInt("batt_soc_min", batt_soc_min);
+        }
+        if (server.hasArg("batt_soc_start")) {
+          input_value = server.arg("batt_soc_start");  
+          batt_soc_start = input_value.toInt();
+          prefs.putInt("batt_soc_start", batt_soc_start);
+        }
+        prefs.end();
+        /*
+        delay(10);
+
+        if(prefs.begin("solar-app", true)) {
+          batt_cap_ah = prefs.getInt("batt_cap_ah", 99);
+          prefs.end();
+          //server.sendHeader("Connection", "close");
+          //server.send(200, "text/plain", String(batt_cap_ah));
+        } else {
+          server.sendHeader("Connection", "close");
+          server.send(200, "text/plain", "Failed to being() prefs for read");
+        }
+        */
+      } else {
+        server.sendHeader("Connection", "close");
+        server.send(200, "text/plain", "Failed to being() prefs for write");
       }
     }
-    // Clear the header variable
-    header = "";
-    // Close the connection
-    one_client.stop();
-    Serial.println("Client disconnected.");
-    Serial.println("");
+    server.sendHeader("Location", "/new", true);
+    server.send(302, "text/plain", "");
+  });
+  server.on("/serverIndex", HTTP_GET, []() {
+    server.sendHeader("Connection", "close");
+    server.send(200, "text/html", serverIndex);
+  });
+  /*handling uploading firmware file */
+  server.on("/update", HTTP_POST, []() {
+    server.sendHeader("Connection", "close");
+    server.send(200, "text/plain", (Update.hasError()) ? "FAIL" : "OK");
+    ESP.restart();
+  }, []() {
+    HTTPUpload& upload = server.upload();
+    flashing_ota = true;
+    if (upload.status == UPLOAD_FILE_START) {
+      Serial.printf("Update: %s\n", upload.filename.c_str());
+      if (!Update.begin(UPDATE_SIZE_UNKNOWN)) { //start with max available size
+        Update.printError(Serial);
+      }
+    } else if (upload.status == UPLOAD_FILE_WRITE) {
+      /* flashing firmware to ESP*/
+      if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
+        Update.printError(Serial);
+      }
+    } else if (upload.status == UPLOAD_FILE_END) {
+      if (Update.end(true)) { //true to set the size to the current progress
+        Serial.printf("Update Success: %u\nRebooting...\n", upload.totalSize);
+      } else {
+        Update.printError(Serial);
+      }
+    }
+  });
+}
+
+String getTimestamp() {
+  time_t    now;
+  struct tm asdf;
+  char      buf[80];
+  if (!getLocalTime(&asdf)) {
+    //Serial.println("Failed to obtain time");
+    return "";
+  } else {
+    time(&now);
+    asdf = *localtime(&now);
   }
+  strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S %Z", &asdf);
+  return String(buf);
+  //printf("%s\n", buf);
+  //return now;
 }
 
 void harvest_data() {
-  static uint32_t i;
-  i++;
+  if(!flashing_ota) {
+    static uint32_t i;
+    i++;
 
-  // set word 0 of TX buffer to least-significant word of counter (bits 15..0)
-  node.setTransmitBuffer(0, lowWord(i));  
-  // set word 1 of TX buffer to most-significant word of counter (bits 31..16)
-  node.setTransmitBuffer(1, highWord(i));
+    // set word 0 of TX buffer to least-significant word of counter (bits 15..0)
+    node.setTransmitBuffer(0, lowWord(i));  
+    // set word 1 of TX buffer to most-significant word of counter (bits 31..16)
+    node.setTransmitBuffer(1, highWord(i));
+
+    renogy_read_data_registers();
+
+    renogy_read_info_registers();
+  }
+}
+
+void turn_off_load(String decision = "") {
+  if(decision != "") {
+    automatic_decision = decision;
+    AppendStatus(automatic_decision);
+  }
+  renogy_control_load(0);
+  load_running = false;
+  next_available_startup = millis() + shutdown_cooldown_ms;
+}
+
+void power_on_load(String decision = "") {
+  if(decision != "") {
+    automatic_decision = decision;
+    AppendStatus(automatic_decision);
+  }
+  renogy_control_load(1);
+  load_running = true;
 }
 
 void update_decisions() {
   if (renogy_data.battery_voltage < minimum_shutoff_voltage) {
-    AppendStatus("Turn load off (voltage)");
-    automatic_decision = "Turn off load (voltage)";
-    renogy_control_load(0);
-    load_running = false;
+    turn_off_load("Turn load off (voltage) " + String(renogy_data.battery_voltage) + " < " + String(minimum_shutoff_voltage));
+    //automatic_decision = "Turn load off (voltage) " + String(renogy_data.battery_voltage) + " < " + String(minimum_shutoff_voltage);
+    //AppendStatus(automatic_decision);
+    //renogy_control_load(0);
+    //load_running = false;
+    //next_available_startup = millis() + shutdown_cooldown_ms;
     sim_bat_volt_change = fabs(sim_bat_volt_change) * 1.0;
     sim_bat_soc_change = fabs(sim_bat_soc_change);
   } else {
-    if (renogy_data.battery_soc < minimum_shutoff_soc) {
-      AppendStatus("Turn load off (battery)");
-      automatic_decision = "Turn off load (battery)";
-      //status_str = "Turn load off (battery)";
-      renogy_control_load(0);
-      load_running = false;
+    if (renogy_data.battery_soc < batt_soc_min) {
+      turn_off_load("Turn load off (battery soc) " + String(renogy_data.battery_soc) + " < " + String(batt_soc_min));
+      //automatic_decision = "Turn load off (battery soc) " + String(renogy_data.battery_soc) + " < " + String(batt_soc_min);
+      //AppendStatus(automatic_decision);
+      //renogy_control_load(0);
+      //load_running = false;
+      //next_available_startup = millis() + shutdown_cooldown_ms;
       sim_bat_volt_change = fabs(sim_bat_volt_change) * 1.0;
       sim_bat_soc_change = fabs(sim_bat_soc_change);
     } else {
-      //Serial.println("Load on");
-      // Only if it's daytime!?
-      automatic_decision = "Turn on load";
+      if(renogy_data.battery_voltage > minimum_starting_voltage && renogy_data.battery_soc > batt_soc_start && !load_running) {
+        if(next_available_startup != 0 && millis() < next_available_startup) {
+          automatic_decision = "Wait for cooldown " + String(next_available_startup-millis());
+          //AppendStatus(automatic_decision);
+        } else {
+          power_on_load("Turn on load @ " + String(getTimestamp()));
+          //automatic_decision = "Turn on load @ " + String(getTimestamp());
+          //renogy_control_load(1);
+          //load_running = true;
+        }
+        //AppendStatus(automatic_decision);
+
+        if(simulator_mode) {
+          renogy_data.load_watts = 8;
+        }
+        sim_bat_volt_change = fabs(sim_bat_volt_change) * -1.0;
+        sim_bat_soc_change = -fabs(sim_bat_soc_change);
+      }
     }
   }
   if (renogy_data.load_watts > 0) {
@@ -368,48 +612,54 @@ void update_decisions() {
     load_running = false;
   }
 
+  AppendStatus(getTimestamp());
+  AppendStatus("Battery Capacity AH: " + String(batt_cap_ah) + " @ " + String(renogy_data.battery_soc) + "%");
   //if (renogy_data.solar_panel_watts > renogy_data.load_watts) {
   float panel_incoming_rate_ah = (renogy_data.solar_panel_watts*1.0) / (battery_voltage*1.0);
+  AppendStatus("Panel is at " + String(renogy_data.solar_panel_amps) + " amps (r) and " + String(renogy_data.solar_panel_watts) + " watts (r)");
+  AppendStatus("Panel is producing " + String(panel_incoming_rate_ah) + " ah (c)");
   float load_outgoing_rate_ah = renogy_data.load_watts / (battery_voltage*1.0);
-  AppendStatus("Load is consuming " + String(load_outgoing_rate_ah) + " ah");
+  AppendStatus("Load is consuming " + String(load_outgoing_rate_ah) + " ah (c) and " + String(renogy_data.load_watts) + " watts (r)");
   float charging_rate_ah = panel_incoming_rate_ah - load_outgoing_rate_ah;
+  AppendStatus("Battery drain or fill rate is " + String(charging_rate_ah) + " ah (c)");
   if(charging_rate_ah == 0) {
-    AppendStatus("Battery is idle at " + String(renogy_data.battery_soc) + "%");
-    AppendStatus("Panel is at " + String(renogy_data.solar_panel_amps) + " amps and " + String(renogy_data.solar_panel_watts) + " watts");
+    AppendStatus("Battery is holding steady");
+    //AppendStatus("Panel is at " + String(renogy_data.solar_panel_amps) + " amps and " + String(renogy_data.solar_panel_watts) + " watts");
   } else if(charging_rate_ah > 0) {
     AppendStatus("Battery is charging at " + String(charging_rate_ah) + " ah");  
-    float ah_left_to_charge = ((battery_capacity_ah*1.0) * (100-renogy_data.battery_soc))/100;
-    AppendStatus("Battery is at " + String(renogy_data.battery_soc) + "%. So " + String(ah_left_to_charge) + "ah left to charge");
+    float ah_left_to_charge = ((batt_cap_ah*1.0) * (100-renogy_data.battery_soc))/100;
+    AppendStatus("It's at " + String(renogy_data.battery_soc) + "% so just " + String(ah_left_to_charge) + "ah left to charge");
     float time_to_full = ah_left_to_charge / charging_rate_ah;
     AppendStatus("Battery should be full in " + String(time_to_full) + " hours");
   } else {
-    AppendStatus("Battery is discharging at " + String(charging_rate_ah) + " ah");  
-    float time_to_empty = ((battery_capacity_ah*1.0*max_battery_discharge)/(charging_rate_ah*1.0));
-    AppendStatus("Battery will be empty in " + String(time_to_empty) + " hours");  
+    AppendStatus("Battery is discharging at " + String(charging_rate_ah) + " ah");
+    // We're discharging... so multiply by negative one so the time_to_empty is a positive value
+    //(((51/100)-(1-0.5))*10)/(-0.25*-1.0)
+    //          ((.51-.5)*10)/(-0.25*-1.0)
+    //               (.01*10)/0.25
+    // 0.1 / 0.25 = .4 == 24 minutes
+    float time_to_empty = (((renogy_data.battery_soc/100.00)-(1-max_battery_discharge))*batt_cap_ah)/(charging_rate_ah*-1.0);
+    AppendStatus("At that rate it will be empty in " + String(time_to_empty) + " hours");  
+    if(time_to_empty <= 0.5) {
+      turn_off_load("Battery will be dead in less than 30 minutes!  Kill the load!");
+      //AppendStatus("Battery will be dead in less than 30 minutes!  Kill the load!");
+    }
   }
 
   //float charging_rate_ah = renogy.battery_charging_amps
   //AppendStatus("Battery is charging at " + String(charging_rate_ah) + " ah");
-  //float ah_left_to_charge = ((battery_capacity_ah*1.0) - ((battery_capacity_ah*1.0) * (renogy_data.battery_soc / 100)));
+  //float ah_left_to_charge = ((batt_cap_ah*1.0) - ((batt_cap_ah*1.0) * (renogy_data.battery_soc / 100)));
 
-  if(renogy_data.battery_voltage > minimum_starting_voltage && renogy_data.battery_soc > minimum_starting_soc && !load_running) {
-    AppendStatus("Load would automatically turn on here");
-    if(simulator_mode) {
-      renogy_data.load_watts = 8;
-    }
-    sim_bat_volt_change = fabs(sim_bat_volt_change) * -1.0;
-    sim_bat_soc_change = -fabs(sim_bat_soc_change);
-  }
+
 }
 
 void loop()
 {
   status_str = "";
   loop_number++;
-
-  //harvest_data();
-
-  //update_decisions();
+  if(loop_number <= 1) {
+    Serial.println("Entering loop");
+  }
   
   if(simulator_mode) {
     renogy_data.battery_voltage += (sim_bat_volt_change*1.0);
@@ -428,68 +678,77 @@ void loop()
     }
   }
 
+  currentMillis = millis();
   // Only read info every 10th loop
-  if (loop_number % 10 == 0) {
+  if ((currentMillis - lastTime) > timerDelayMS || loop_number <= 1) {
+    Serial.println("Updating data");
+    //if (loop_number % 10 == 0 && !flashing_ota) {
     harvest_data();
-
-    Serial.println("Battery voltage: " + String(renogy_data.battery_voltage));
-    Serial.println("Battery charge level: " + String(renogy_data.battery_soc) + "%");
-    Serial.println("Panel wattage: " + String(renogy_data.solar_panel_watts));
-
     update_decisions();
 
-    Serial.println("---");
+    //Serial.println("Battery voltage: " + String(renogy_data.battery_voltage));
+    //Serial.println("Battery charge level: " + String(renogy_data.battery_soc) + "%");
+    //Serial.println("Panel wattage: " + String(renogy_data.solar_panel_watts));
+
+    //Serial.println("---");
 
     //Send an HTTP POST request every 10 minutes
-    if ((millis() - lastTime) > timerDelayMS) {
+    if ((currentMillis - lastTime) > timerDelayMS) {
       //Check WiFi connection status
       if(WiFi.status()== WL_CONNECTED){
         //WiFiClient client;
         //HTTPClient http;
       
-        // Your Domain name with URL path or IP address with path
-        http.begin(client, serverName);
-        
-        // If you need Node-RED/server authentication, insert user and password below
-        //http.setAuthorization("REPLACE_WITH_SERVER_USERNAME", "REPLACE_WITH_SERVER_PASSWORD");
-        
-        // Specify content-type header
-        http.addHeader("Content-Type", "application/json");
-        String theStr = structToString(renogy_data);
-        Serial.println(theStr);
-        // Data to send with HTTP POST
-        String httpRequestData = theStr;
-        int httpResponseCode = 0;
-        // Send HTTP POST request
         if(renogy_data.controller_connected) {
-          Serial.print("POSTing http data");
-          httpResponseCode = http.POST(httpRequestData);
-        }
-        
-        // If you need an HTTP request with a content type: application/json, use the following:
-        //http.addHeader("Content-Type", "application/json");
-        //int httpResponseCode = http.POST("{\"api_key\":\"tPmAT5Ab3j7F9\",\"sensor\":\"BME280\",\"value1\":\"24.25\",\"value2\":\"49.54\",\"value3\":\"1005.14\"}");
-
-        // If you need an HTTP request with a content type: text/plain
-        //http.addHeader("Content-Type", "text/plain");
-        //int httpResponseCode = http.POST("Hello, World!");
-      
-        Serial.print("HTTP Response code: ");
-        AppendStatus("Latest Posting Reponse Code: " + String(httpResponseCode));
+          // Your Domain name with URL path or IP address with path
+          http.begin(client, serverName);
           
-        // Free resources
-        http.end();
+          // If you need Node-RED/server authentication, insert user and password below
+          //http.setAuthorization("REPLACE_WITH_SERVER_USERNAME", "REPLACE_WITH_SERVER_PASSWORD");
+          
+          // Specify content-type header
+          http.addHeader("Content-Type", "application/json");
+
+          // Data to send with HTTP POST
+          String httpRequestData = structToString(renogy_data);
+          Serial.println("POSTing http data:");
+          Serial.println(httpRequestData);
+          int httpResponseCode = http.POST(httpRequestData);
+
+          Serial.print("HTTP Response code: ");
+          AppendStatus("Latest Posting Reponse Code: " + String(httpResponseCode));
+
+          // Free resources
+          http.end();
+        }
       }
       else {
         Serial.println("WiFi Disconnected");
       }
       lastTime = millis();
     }
+    lastTime = millis();
   }
 
-  handle_webserver_connection();
+  if ((currentMillis - lastWebTime) > 1000) {
+    handle_webserver_connection();
+    delay(1);
+    lastWebTime = millis();
+  }
 
-  delay(6000);
+  //loop to blink without delay
+  currentMillis = millis();
+
+  if (currentMillis - previousMillis >= interval) {
+    // save the last time you blinked the LED
+    previousMillis = currentMillis;
+
+    // if the LED is off turn it on and vice-versa:
+    //ledState = not(ledState);
+
+    // set the LED with the ledState of the variable:
+    //digitalWrite(led, ledState);
+  }
 }
 
 
