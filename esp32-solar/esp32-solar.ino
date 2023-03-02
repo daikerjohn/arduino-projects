@@ -16,6 +16,8 @@ To do:
 
 */
 
+#include <queue>
+#include <deque>
 
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
@@ -50,6 +52,11 @@ String status_str = "";
 WiFiClientSecure client;  // or WiFiClientSecure for HTTPS
 HTTPClient http;
 
+//For UTC -8.00 : -8 * 60 * 60 : -28800
+const long  gmtOffset_sec = -28800;
+//Set it to 3600 if your country observes Daylight saving time; otherwise, set it to 0.
+const int   daylightOffset_sec = 3600;
+
 bool flashing_ota = false;
 
 const char* ssid = "dirker";
@@ -66,12 +73,15 @@ unsigned long lastWebTime = 0;
 // Timer set to 10 minutes (600000)
 //unsigned long timerDelayMS = 600000;
 // Set timer to 5 seconds (5000)
-//unsigned long timerDelayMS = 5000;
+unsigned long timerDelayMS = 5000;
 // Set timer to 60 seconds (60000)
-unsigned long timerDelayMS = 60000;
+//unsigned long timerDelayMS = 60000;
 
 unsigned long previousMillis = 0;        // will store last time LED was updated
 const long interval = 6000;           // interval at which to blink (milliseconds)
+
+const int num_data_points_sma = 10;
+const int num_data_points_decision = 8;
 
 /*
 A note about which pins to use: 
@@ -145,6 +155,48 @@ struct Controller_info {
 };
 Controller_info renogy_info;
 
+void AppendStatus(String asdf) {
+  Serial.println(asdf);
+  status_str += "<p>" + String(asdf) + "</p>\n";
+}
+
+template <typename T, int MaxLen, typename Container=std::deque<T>>
+class FixedQueue : public std::queue<T, Container> {
+public:
+    void push(const T& value) {
+        if (this->size() == MaxLen) {
+           this->c.pop_front();
+        }
+        std::queue<T, Container>::push(value);
+    }
+    T html() {
+      //int num_valid = 0;
+      String asdf = "";
+      for(int y = 0; y < this->size(); y++) {
+        asdf += "<p>" + String(this->c[y]) + "</p>";
+      }
+      return asdf;
+    }
+    T average(int *num_valid_ref, String txt) {
+      T avg = 0;
+      T sum = 0;
+      //int num_valid = 0;
+      String asdf = "";
+      for(int y = 0; y < this->size(); y++) {
+        if(this->c[y] > 0) {
+          (*num_valid_ref) += 1;
+          sum += this->c[y];
+          asdf += String(this->c[y]) + ", ";
+        }
+      }
+      if(sum > 0) {
+        avg = (sum/(*num_valid_ref))*1.0;
+      }
+      AppendStatus(txt + " Avg: " + String(avg) + " vals: " + asdf);
+      
+      return avg;
+    }
+};
 
 // if you don't have a charge controller to test with, can set this to true to get non 0 voltage readings
 bool simulator_mode = false;
@@ -154,7 +206,7 @@ int batt_cap_ah = 40;
 float max_battery_discharge = .5;
 
 float batt_volt_min = 11.5;
-float batt_volt_start = 12.5;
+float bat_volt_start = 12.5;
 
 int batt_soc_min = 50;
 int batt_soc_start = 65;
@@ -174,7 +226,20 @@ float sim_bat_soc_change = -1;
 bool load_running = false;
 
 float sim_starting_solar_panel_watts = 20;
+bool first_loop = true;
 int loop_number = 0;
+
+
+float avg_time_to_empty_mins = 0;
+float avg_load_watts = 0;
+float avg_batt_soc = 0;
+float avg_batt_volts = 0;
+
+FixedQueue<float, num_data_points_sma> time_to_empty_queue;
+FixedQueue<float, num_data_points_sma> load_watts_queue;
+FixedQueue<float, num_data_points_sma> battery_soc_queue;
+FixedQueue<float, num_data_points_sma> battery_voltage_queue;
+FixedQueue<String, num_data_points_sma> automatic_decisions;
 
 void notFound(AsyncWebServerRequest *request) {
     request->send(404, "text/plain", "Not found");
@@ -190,27 +255,28 @@ void setup()
   batt_soc_min = prefs.getInt("batt_soc_min", 50);
   batt_soc_start = prefs.getInt("batt_soc_start", 65);
   batt_volt_min = prefs.getDouble("batt_volt_min", 11.5);
-  batt_volt_start = prefs.getDouble("batt_volt_start", 13);
+  bat_volt_start = prefs.getDouble("bat_volt_start", 13);
   shut_cool_ms = prefs.getLong("shut_cool_ms", 300000);
   // Close the Preferences
   prefs.end();
   next_available_startup = millis() + shut_cool_ms;
 
-    WiFi.begin(ssid, password);
-    //WiFi.begin("Wokwi-GUEST", "", 6);
-    while (WiFi.status() != WL_CONNECTED) {
-      delay(250);
-      Serial.println("connecting...");
-    }
+  WiFi.begin(ssid, password);
+  //WiFi.begin("Wokwi-GUEST", "", 6);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(250);
+    Serial.println("connecting...");
+  }
 
-    Serial.println("");
-    Serial.println("WiFi connected");
-    Serial.print("IP address: ");
-    Serial.println(WiFi.localIP());
+  Serial.println("");
+  Serial.println("WiFi connected");
+  Serial.print("IP address: ");
+  Serial.println(WiFi.localIP());
 
-    configTime(0, 0, "pool.ntp.org");
+  configTime(gmtOffset_sec, daylightOffset_sec, "pool.ntp.org");
+  //configTime(0, 0, "pool.ntp.org");
 
-    client.setInsecure();
+  client.setInsecure();
 
   // create a second serial interface for modbus
   Serial2.begin(9600, SERIAL_8N1, RXD2, TXD2); 
@@ -222,15 +288,12 @@ void setup()
 
   AsyncElegantOTA.begin(&server);    // Start AsyncElegantOTA
 
+  handle_webserver_connection();
+
   // Start webserver
   server.begin();
 
   delay(500);
-}
-
-void AppendStatus(String asdf) {
-  Serial.println(asdf);
-  status_str += "<p>" + String(asdf) + "</p>\n";
 }
 
 String structToString(struct Controller_data myData){
@@ -284,11 +347,9 @@ String structToString(struct Controller_data myData){
 String automatic_decision = "";
 String current_status = "";
 
-
-String statsIndex() {
-  String data = "";
+String htmlHead(bool includeReload = true) {
   // Display the HTML web page
-  data += "<!DOCTYPE html><html>";
+  String data = "<!DOCTYPE html><html>";
   data += "<head><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">";
   data += "<link rel=\"icon\" href=\"data:,\">";
   // CSS to style the on/off buttons 
@@ -299,24 +360,39 @@ String statsIndex() {
   data += ".button2 {background-color: #555555;}</style>";
 
   data += "<script>";
-  data += "setTimeout(function(){ window.location.reload(); }, 15000);";
+  if(includeReload) {
+    data += "setTimeout(function(){ window.location.reload(); }, 5000);";
+  }
   data += "</script>";
 
   data += "</head>";
+  return data;
+}
+
+String htmlFoot() {
+  String data = "<p>Compiled: " + String(compile_date) + "</p>";
+  data += "</body></html>";
+  return data;
+}
+
+String statsIndex() {
+  String data = htmlHead();
   
   // Web Page Heading
   data += "<body><h1>ESP32 Web Server - With OTAv3</h1>";
-  data += "<p>Compiled: " + String(compile_date) + "</p>";
   
   // Display current state of the Renogy load
   if(load_running) {
-    data += "<p>Renogy Load - Running @ " + String(renogy_data.load_watts) + " watts</p>";
+    data += "<p>Renogy Load - Running @ " + String(renogy_data.load_watts) + " watts " + String(avg_load_watts) + " avg</p>";
   } else {
     data += "<p>Renogy Load - Stopped - " + String(renogy_data.load_watts) + "</p>";
   }
   if(automatic_decision != "") {
     data += "<p>Last Automatic: " + String(automatic_decision) + "</p>";
   }
+  data += "<p>Automatics</p>";
+  data += automatic_decisions.html();
+
   if(current_status != "") {
     data += "<p>Current: " + String(current_status) + "</p>";
   }
@@ -328,6 +404,14 @@ String statsIndex() {
     data += "<p><a href=\"/load/on\"><button class=\"button\">ON</button></a></p>";
   }
 
+  data += htmlFoot();
+  return data;
+}
+
+
+String configIndex() {
+  String data = htmlHead(false);
+
   data += "<form action=\"/set\">Enter an batt_cap_ah: <input type=\"text\" name=\"batt_cap_ah\" value=\"" + String(batt_cap_ah) + "\"><br/>";
   data += "<input type=\"submit\" value=\"Submit\"></form>";
   data += "<form action=\"/set\">Enter an batt_soc_min: <input type=\"text\" name=\"batt_soc_min\" value=\"" + String(batt_soc_min) + "\"><br/>";
@@ -336,46 +420,79 @@ String statsIndex() {
   data += "<input type=\"submit\" value=\"Submit\"></form>";
   data += "<form action=\"/set\">Enter an batt_volt_min: <input type=\"text\" name=\"batt_volt_min\" value=\"" + String(batt_volt_min) + "\"><br/>";
   data += "<input type=\"submit\" value=\"Submit\"></form>";
-  data += "<form action=\"/set\">Enter an batt_volt_start: <input type=\"text\" name=\"batt_volt_start\" value=\"" + String(batt_volt_start) + "\"><br/>";
+  data += "<form action=\"/set\">Enter an bat_volt_start: <input type=\"text\" name=\"bat_volt_start\" value=\"" + String(bat_volt_start) + "\"><br/>";
   data += "<input type=\"submit\" value=\"Submit\"></form>";
   data += "<form action=\"/set\">Enter an shut_cool_ms: <input type=\"text\" name=\"shut_cool_ms\" value=\"" + String(shut_cool_ms) + "\"><br/>";
   data += "<input type=\"submit\" value=\"Submit\"></form>";
 
-  data += "</body></html>";
+  data += htmlFoot();
   return data;
+}
+
+void turn_off_load(String decision) {
+  if(decision != "") {
+    automatic_decision = decision + " @ " + String(getTimestamp());
+    automatic_decisions.push(automatic_decision);
+    AppendStatus(automatic_decision);
+  }
+  renogy_control_load(0);
+  load_running = false;
+  next_available_startup = millis() + shut_cool_ms;
+}
+
+void power_on_load(String decision) {
+  if(decision != "") {
+    automatic_decision = decision + " @ " + String(getTimestamp());
+    automatic_decisions.push(automatic_decision);
+    AppendStatus(automatic_decision);
+  }
+  renogy_control_load(1);
+  load_running = true;
+  next_available_startup = millis() + shut_cool_ms;
 }
 
 void handle_webserver_connection() {
   server.on("/", HTTP_GET, [] (AsyncWebServerRequest *request) {
     //harvest_data();
     status_str = "";
-    update_decisions();
+    update_decisions(false);
     request->send(200, "text/html", statsIndex());
   });
+  server.on("/heap", HTTP_GET, [] (AsyncWebServerRequest *request) {
+    request->send(200, "text/plain", String(ESP.getFreeHeap()));
+  });
+  server.on("/max", HTTP_GET, [] (AsyncWebServerRequest *request) {
+    request->send(200, "text/plain", String(ESP.getMaxAllocHeap()));
+  });
+
   server.on("/new", HTTP_GET, [] (AsyncWebServerRequest *request) {
     status_str = "";
     harvest_data();
-    update_decisions();
+    update_decisions(false);
     request->send(200, "text/html", statsIndex());
   });
+
+  server.on("/config", HTTP_GET, [] (AsyncWebServerRequest *request) {
+    status_str = "";
+    //harvest_data();
+    //update_decisions();
+    request->send(200, "text/html", configIndex());
+  });
+
+  // Load control
   server.on("/load/on", HTTP_GET, [] (AsyncWebServerRequest *request) {
-    Serial.println("Turn load on");
-    renogy_control_load(1);
-    load_running = true;
-    request->redirect("/new");
+    power_on_load("");
+    request->redirect("/");
   });
   server.on("/load/off", HTTP_GET, [] (AsyncWebServerRequest *request) {
-    Serial.println("Turn load off");
-    renogy_control_load(0);
-    load_running = false;
-    next_available_startup = millis() + shut_cool_ms;
-    request->redirect("/new");
+    turn_off_load("");
+    request->redirect("/");
   });
 
   server.on("/set", HTTP_GET, [] (AsyncWebServerRequest *request) {
-    int new_value;
+    //int new_value;
     String input_value;
-    if (request->hasArg("batt_cap_ah") || request->hasArg("batt_soc_min") || request->hasArg("batt_soc_start") || request->hasArg("batt_volt_min") || request->hasArg("batt_volt_start") || request->hasArg("shut_cool_ms")) {
+    if (request->hasArg("batt_cap_ah") || request->hasArg("batt_soc_min") || request->hasArg("batt_soc_start") || request->hasArg("batt_volt_min") || request->hasArg("bat_volt_start") || request->hasArg("shut_cool_ms")) {
       if(prefs.begin("solar-app", false)) {
         if (request->hasArg("batt_cap_ah")) {
           input_value = request->arg("batt_cap_ah");
@@ -397,10 +514,10 @@ void handle_webserver_connection() {
           batt_volt_min = input_value.toFloat();
           prefs.putFloat("batt_volt_min", batt_volt_min);
         }
-        if (request->hasArg("batt_volt_start")) {
-          input_value = request->arg("batt_volt_start");  
-          batt_volt_start = input_value.toFloat();
-          prefs.putFloat("batt_volt_start", batt_volt_start);
+        if (request->hasArg("bat_volt_start")) {
+          input_value = request->arg("bat_volt_start");  
+          bat_volt_start = input_value.toFloat();
+          prefs.putFloat("bat_volt_start", bat_volt_start);
         }
         if (request->hasArg("shut_cool_ms")) {
           input_value = request->arg("shut_cool_ms");  
@@ -413,7 +530,7 @@ void handle_webserver_connection() {
         request->send(200, "text/plain", "Failed to being() prefs for write");
       }
     }
-    request->redirect("/new");
+    request->redirect("/config");
   });
 
   server.onNotFound(notFound);
@@ -430,7 +547,7 @@ String getTimestamp() {
     time(&now);
     asdf = *localtime(&now);
   }
-  strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S %Z", &asdf);
+  strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S %z", &asdf);
   return String(buf);
   //printf("%s\n", buf);
   //return now;
@@ -447,224 +564,266 @@ void harvest_data() {
     node.setTransmitBuffer(1, highWord(i));
 
     renogy_read_data_registers();
+    if(renogy_data.controller_connected && renogy_data.battery_voltage >= 256) {
+      // Likely bad data. Delay and try again
+      delay(10);
+      renogy_read_data_registers();
+    }
 
-    renogy_read_info_registers();
+    //renogy_read_info_registers();
   }
 }
 
-void turn_off_load(String decision) {
-  if(decision != "") {
-    automatic_decision = decision + " @ " + String(getTimestamp());
-    AppendStatus(automatic_decision);
+void update_decisions(bool allow_automatic) {
+  AppendStatus("Current Time: " + String(getTimestamp()));
+  if (renogy_data.controller_connected == false && !simulator_mode) {
+    AppendStatus("Controller is not connected. No decisions will be made");
+    return;
   }
-  renogy_control_load(0);
-  load_running = false;
-  next_available_startup = millis() + shut_cool_ms;
-}
 
-void power_on_load(String decision) {
-  if(decision != "") {
-    automatic_decision = decision + " @ " + String(getTimestamp());
-    AppendStatus(automatic_decision);
+  if(allow_automatic) {
+    battery_voltage_queue.push(renogy_data.battery_voltage);
+    battery_soc_queue.push(renogy_data.battery_soc);
+    load_watts_queue.push((float)renogy_data.load_watts);
   }
-  renogy_control_load(1);
-  load_running = true;
-}
 
-void update_decisions() {
-  if (renogy_data.battery_voltage < batt_volt_min) {
-    turn_off_load("Turn load off (voltage) " + String(renogy_data.battery_voltage) + " < " + String(batt_volt_min));
-    sim_bat_volt_change = fabs(sim_bat_volt_change) * 1.0;
-    sim_bat_soc_change = fabs(sim_bat_soc_change);
-  } else {
-    if (renogy_data.battery_soc < batt_soc_min) {
-      turn_off_load("Turn load off (battery soc) " + String(renogy_data.battery_soc) + " < " + String(batt_soc_min));
-      sim_bat_volt_change = fabs(sim_bat_volt_change) * 1.0;
-      sim_bat_soc_change = fabs(sim_bat_soc_change);
+  int valid_data_points_battery_voltage = 0;
+  avg_batt_volts = battery_voltage_queue.average(&valid_data_points_battery_voltage, "Battery Voltage");
+
+  int valid_data_points_battery_soc = 0;  
+  avg_batt_soc = battery_soc_queue.average(&valid_data_points_battery_soc, "Battery SOC");
+
+  int valid_data_points_load_watts = 0;
+  avg_load_watts = load_watts_queue.average(&valid_data_points_load_watts, "Load Watts");
+
+  if(allow_automatic) {
+    if(valid_data_points_load_watts > num_data_points_decision) {
+      if (avg_load_watts > 0.1) {
+        load_running = true;
+      }
     } else {
-      if(renogy_data.battery_voltage > batt_volt_start && renogy_data.battery_soc > batt_soc_start && !load_running) {
-        if(next_available_startup != 0 && millis() < next_available_startup) {
-          current_status = "Wait for cooldown " + String(next_available_startup-millis());
-        } else {
-          power_on_load("Turn on load");
-          current_status = "";
-        }
-
-        if(simulator_mode) {
-          renogy_data.load_watts = 8;
-        }
-        sim_bat_volt_change = fabs(sim_bat_volt_change) * -1.0;
-        sim_bat_soc_change = -fabs(sim_bat_soc_change);
+      if (load_running && avg_load_watts == 0 && renogy_data.controller_connected) {
+        load_running = false;
       }
     }
   }
-  if (renogy_data.load_watts > 0) {
-    load_running = true;
-  }
-  if (renogy_data.load_watts == 0 && renogy_data.controller_connected && load_running) {
-    load_running = false;
+
+  if(valid_data_points_battery_voltage > num_data_points_decision && valid_data_points_battery_soc > num_data_points_decision) {
+    if (load_running && avg_batt_volts < batt_volt_min) {
+      if(allow_automatic) {
+        turn_off_load("Turn load off (voltage) " + String(avg_batt_volts) + " < " + String(batt_volt_min));
+      }
+      sim_bat_volt_change = fabs(sim_bat_volt_change) * 1.0;
+      sim_bat_soc_change = fabs(sim_bat_soc_change);
+    } else {
+      if (load_running && avg_batt_soc < batt_soc_min) {
+        if(allow_automatic) {
+          turn_off_load("Turn load off (battery soc) " + String(avg_batt_soc) + " < " + String(batt_soc_min));
+        }
+        sim_bat_volt_change = fabs(sim_bat_volt_change) * 1.0;
+        sim_bat_soc_change = fabs(sim_bat_soc_change);
+      } else {
+        if(load_running) {
+          current_status = "";
+          //AppendStatus("Load already on");
+        } else {
+          if(avg_batt_volts > bat_volt_start) {
+            if(avg_batt_soc > batt_soc_start) {
+              if(next_available_startup != 0 && millis() > next_available_startup) {
+                if(allow_automatic) {
+                  power_on_load("Turn on load");
+                }
+                current_status = "";
+              } else {
+                AppendStatus("Wait for cooldown: " + String(next_available_startup-millis()));
+                current_status = "Wait for cooldown " + String(next_available_startup-millis());
+              }
+
+              if(simulator_mode) {
+                renogy_data.load_watts = 8;
+              }
+              sim_bat_volt_change = fabs(sim_bat_volt_change) * -1.0;
+              sim_bat_soc_change = -fabs(sim_bat_soc_change);
+            } else {
+              AppendStatus("SOC too low to start");
+            }
+          } else {
+            AppendStatus("Volts too low to start");
+          }
+        }
+      }
+    }
+  } else {
+    AppendStatus("Not enough valid data. Skipping decision");
+    return;
   }
 
-  AppendStatus(getTimestamp());
-  AppendStatus("Battery Capacity AH: " + String(batt_cap_ah) + " @ " + String(renogy_data.battery_soc) + "%");
-  //if (renogy_data.solar_panel_watts > renogy_data.load_watts) {
+  //AppendStatus(String(ESP.getFreeHeap()));
+  AppendStatus("Battery Capacity AH: " + String(batt_cap_ah) + " @ " + String(avg_batt_soc) + "% @ " + String(avg_batt_volts) + "v");
+
   float panel_incoming_rate_ah = (renogy_data.solar_panel_watts*1.0) / (battery_voltage*1.0);
   AppendStatus("Panel is at " + String(renogy_data.solar_panel_amps) + " amps (r) and " + String(renogy_data.solar_panel_watts) + " watts (r)");
   AppendStatus("Panel is producing " + String(panel_incoming_rate_ah) + " ah (c)");
-  float load_outgoing_rate_ah = renogy_data.load_watts / (battery_voltage*1.0);
-  AppendStatus("Load is consuming " + String(load_outgoing_rate_ah) + " ah (c) and " + String(renogy_data.load_watts) + " watts (r)");
-  float charging_rate_ah = panel_incoming_rate_ah - load_outgoing_rate_ah;
-  AppendStatus("Battery drain or fill rate is " + String(charging_rate_ah) + " ah (c)");
-  if(charging_rate_ah == 0) {
-    AppendStatus("Battery is holding steady");
-    //AppendStatus("Panel is at " + String(renogy_data.solar_panel_amps) + " amps and " + String(renogy_data.solar_panel_watts) + " watts");
-  } else if(charging_rate_ah > 0) {
-    AppendStatus("Battery is charging at " + String(charging_rate_ah) + " ah");  
-    float ah_left_to_charge = ((batt_cap_ah*1.0) * (100-renogy_data.battery_soc))/100;
-    AppendStatus("It's at " + String(renogy_data.battery_soc) + "% so just " + String(ah_left_to_charge) + "ah left to charge");
-    float time_to_full = ah_left_to_charge / charging_rate_ah;
-    AppendStatus("Battery should be full in " + String(time_to_full) + " hours");
-  } else {
-    AppendStatus("Battery is discharging at " + String(charging_rate_ah) + " ah");
-    // We're discharging... so multiply by negative one so the time_to_empty is a positive value
-    //(((51/100)-(1-0.5))*10)/(-0.25*-1.0)
-    //          ((.51-.5)*10)/(-0.25*-1.0)
-    //               (.01*10)/0.25
-    // 0.1 / 0.25 = .4 == 24 minutes
-    float time_to_empty = (((renogy_data.battery_soc/100.00)-(1-max_battery_discharge))*batt_cap_ah)/(charging_rate_ah*-1.0);
-    AppendStatus("At that rate it will be empty in " + String(time_to_empty) + " hours");  
-    if(time_to_empty <= 0.5) {
-      turn_off_load("Battery will be dead in less than 30 minutes!  Kill the load!");
-      //AppendStatus("Battery will be dead in less than 30 minutes!  Kill the load!");
+
+  if(valid_data_points_load_watts > num_data_points_decision) {
+    float load_outgoing_rate_ah = avg_load_watts / (battery_voltage*1.0);
+    AppendStatus("Load is consuming " + String(load_outgoing_rate_ah) + " ah (c) and " + String(avg_load_watts) + " watts (r)");
+
+    float charging_rate_ah = panel_incoming_rate_ah - load_outgoing_rate_ah;
+    AppendStatus("Battery drain or fill rate is " + String(charging_rate_ah) + " ah (c)");
+
+    if(charging_rate_ah == 0) {
+      AppendStatus("Battery is holding steady");
+      //AppendStatus("Panel is at " + String(renogy_data.solar_panel_amps) + " amps and " + String(renogy_data.solar_panel_watts) + " watts");
+    } else if(charging_rate_ah > 0) {
+      AppendStatus("Battery is charging at " + String(charging_rate_ah) + " ah");  
+      float ah_left_to_charge = ((batt_cap_ah*1.0) * (100-avg_batt_soc))/100;
+      AppendStatus("It's at " + String(avg_batt_soc) + "% so just " + String(ah_left_to_charge) + "ah left to charge");
+      float time_to_full = ah_left_to_charge / charging_rate_ah;
+      AppendStatus("Battery should be full in " + String(time_to_full) + " hours");
+    } else {
+      // We're discharging... so multiply by negative one so the time_to_empty is a positive value
+      //(((51/100)-(1-0.5))*10)/(-0.25*-1.0)
+      //          ((.51-.5)*10)/(-0.25*-1.0)
+      //               (.01*10)/0.25
+      // 0.1 / 0.25 = .4 == 24 minutes
+      float time_to_empty_hrs = (((avg_batt_soc/100.00)-(1-max_battery_discharge))*batt_cap_ah)/(charging_rate_ah*-1.0);
+      float time_to_empty_mins = time_to_empty_hrs*60;
+      
+      time_to_empty_queue.push(time_to_empty_mins);
+
+      int valid_data_points_tte = 0;
+      float avg_time_to_empty_mins = time_to_empty_queue.average(&valid_data_points_tte, "Time-To-Empty");
+      AppendStatus("Average TTE_Mins: " + String(avg_time_to_empty_mins) + " with " + String(valid_data_points_tte) + " points");
+      /*
+      String asdf = "";
+      valid_data_points = 0;
+      for(int y = 0; y<5; y++) {
+        if(average_time_to_empty[y] > 0) {
+          valid_data_points += 1;
+          avg_time_to_empty_mins += average_time_to_empty[y];
+          asdf += String(average_time_to_empty[y]) + ", ";          
+        }
+      }
+      AppendStatus("TTE_Mins: " + asdf);
+      avg_time_to_empty_mins = (avg_time_to_empty_mins/valid_data_points)*1.0;
+      AppendStatus("Average TTE_Mins: " + String(avg_time_to_empty_mins));
+      */
+
+      AppendStatus("Battery is discharging at " + String(charging_rate_ah) + " ah");
+      if((avg_time_to_empty_mins < 60 && valid_data_points_tte > num_data_points_decision)) {
+        AppendStatus("At that rate it will be empty in " + String(avg_time_to_empty_mins) + " minutes");  
+        if((avg_time_to_empty_mins < 15 && valid_data_points_tte > num_data_points_decision)) {
+          if(allow_automatic) {
+            turn_off_load("Battery will be dead in less than 15 minutes!  Kill the load!" + String(avg_time_to_empty_mins) + " to go");
+          }
+          //AppendStatus("Battery will be dead in less than 30 minutes!  Kill the load!");
+        }
+      } else {
+        AppendStatus("At that rate it will be empty in " + String(avg_time_to_empty_mins/60) + " hours");
+      }
     }
+  } else {
+    AppendStatus("Not enough load points");
   }
 
   //float charging_rate_ah = renogy.battery_charging_amps
   //AppendStatus("Battery is charging at " + String(charging_rate_ah) + " ah");
   //float ah_left_to_charge = ((batt_cap_ah*1.0) - ((batt_cap_ah*1.0) * (renogy_data.battery_soc / 100)));
-
-
 }
 
 void loop()
 {
-  status_str = "";
-  loop_number++;
-  if(loop_number <= 1) {
+  //status_str = "";
+  
+  if(first_loop) {
     Serial.println("Entering loop");
   }
   
-  if(simulator_mode) {
-    renogy_data.battery_voltage += (sim_bat_volt_change*1.0);
-    if(renogy_data.battery_voltage > 13.7) {
-      renogy_data.battery_voltage = 13.7;
-    }
-    //if(sim_bat_soc_change > 0) {
-      Serial.println("sim_bat_soc_change: " + String(sim_bat_soc_change));
-    //}
-    renogy_data.battery_soc += sim_bat_soc_change;
-    if(renogy_data.battery_soc > 100) {
-      renogy_data.battery_soc = 100;
-    }
-    if(load_running) {
-      renogy_data.load_watts = 8;
-    }
-  }
-
   currentMillis = millis();
   // Only read info every 10th loop
-  if ((currentMillis - lastTime) > timerDelayMS || loop_number <= 1) {
+  if ((currentMillis - lastTime) > timerDelayMS || first_loop) {
     Serial.println("Updating data");
     //if (loop_number % 10 == 0 && !flashing_ota) {
     status_str = "";
     harvest_data();
-    update_decisions();
 
-    //Serial.println("Battery voltage: " + String(renogy_data.battery_voltage));
-    //Serial.println("Battery charge level: " + String(renogy_data.battery_soc) + "%");
-    //Serial.println("Panel wattage: " + String(renogy_data.solar_panel_watts));
+    if(simulator_mode) {
+      renogy_data.battery_voltage += (sim_bat_volt_change*1.0);
+      if(renogy_data.battery_voltage > 13.7) {
+        renogy_data.battery_voltage = 13.7;
+      }
+      //if(sim_bat_soc_change > 0) {
+        //Serial.println("sim_bat_soc_change: " + String(sim_bat_soc_change));
+      //}
+      renogy_data.battery_soc += sim_bat_soc_change;
+      if(renogy_data.battery_soc > 100) {
+        renogy_data.battery_soc = 100;
+      }
+      if(load_running) {
+        renogy_data.load_watts = 8;
+      }
+    }
 
-    //Serial.println("---");
+    update_decisions(true);
 
     //Send an HTTP POST request every 10 minutes
-    if ((currentMillis - lastTime) > timerDelayMS) {
-      //Check WiFi connection status
-      if(WiFi.status()== WL_CONNECTED){
-        //WiFiClient client;
-        //HTTPClient http;
-      
-        if(renogy_data.controller_connected) {
-          // Your Domain name with URL path or IP address with path
-          http.begin(client, serverName);
-          
-          // If you need Node-RED/server authentication, insert user and password below
-          //http.setAuthorization("REPLACE_WITH_SERVER_USERNAME", "REPLACE_WITH_SERVER_PASSWORD");
-          
-          // Specify content-type header
-          http.addHeader("Content-Type", "application/json");
+    //if ((currentMillis - lastTime) > timerDelayMS) {
+    //Check WiFi connection status
+    if(WiFi.status()== WL_CONNECTED){
+      if(renogy_data.controller_connected) {
+        // Your Domain name with URL path or IP address with path
+        http.begin(client, serverName);
+        
+        // If you need Node-RED/server authentication, insert user and password below
+        //http.setAuthorization("REPLACE_WITH_SERVER_USERNAME", "REPLACE_WITH_SERVER_PASSWORD");
+        
+        // Specify content-type header
+        http.addHeader("Content-Type", "application/json");
 
-          // Data to send with HTTP POST
-          String httpRequestData = structToString(renogy_data);
-          Serial.println("POSTing http data:");
-          Serial.println(httpRequestData);
-          int httpResponseCode = http.POST(httpRequestData);
+        // Data to send with HTTP POST
+        String httpRequestData = structToString(renogy_data);
+        Serial.println("POSTing http data:");
+        Serial.println(httpRequestData);
+        int httpResponseCode = http.POST(httpRequestData);
 
-          Serial.print("HTTP Response code: ");
-          AppendStatus("Latest Posting Reponse Code: " + String(httpResponseCode));
+        Serial.print("HTTP Response code: ");
+        AppendStatus("Latest Posting Reponse Code: " + String(httpResponseCode));
 
-          // Free resources
-          http.end();
-        }
+        // Free resources
+        http.end();
       }
-      else {
-        Serial.println("WiFi Disconnected");
-      }
-      lastTime = millis();
+    } else {
+      Serial.println("WiFi Disconnected");
     }
+    //  lastTime = millis();
+    //}
     lastTime = millis();
+    loop_number++;
   }
 
-  if ((currentMillis - lastWebTime) > 1000) {
-    handle_webserver_connection();
-    delay(1);
-    lastWebTime = millis();
-  }
-
-  //loop to blink without delay
-  currentMillis = millis();
-
-  if (currentMillis - previousMillis >= interval) {
-    // save the last time you blinked the LED
-    previousMillis = currentMillis;
-
-    // if the LED is off turn it on and vice-versa:
-    //ledState = not(ledState);
-
-    // set the LED with the ledState of the variable:
-    //digitalWrite(led, ledState);
-  }
+  first_loop = false;
 }
 
 
 
 void renogy_read_data_registers() 
 {
-  uint8_t j, result;
   uint16_t data_registers[num_data_registers];
-  char buffer1[40], buffer2[40];
-  uint8_t raw_data;
+  //char buffer1[40], buffer2[40];
+  //uint8_t raw_data;
 
   // prints data about each read to the console
-  bool print_data=0; 
+  bool print_data=false; 
   
-  result = node.readHoldingRegisters(0x100, num_data_registers);
+  uint8_t result = node.readHoldingRegisters(0x100, num_data_registers);
   if (result == node.ku8MBSuccess)
   {
     if (print_data) {
       AppendStatus("Successfully read the data registers!");
     }
     renogy_data.controller_connected = true;
-    for (j = 0; j < num_data_registers; j++)
+    for (uint8_t j = 0; j < num_data_registers; j++)
     {
       data_registers[j] = node.getResponseBuffer(j);
       if (print_data) Serial.println(data_registers[j]);
@@ -744,7 +903,7 @@ void renogy_read_data_registers()
     //renogy_data.solar_panel_watts = 0;
     renogy_data.battery_charging_watts = 0;
     if (simulator_mode) {
-      if(loop_number <= 1) {
+      if(first_loop) {
         renogy_data.battery_voltage = sim_starting_battery_voltage;    
         renogy_data.battery_soc = sim_starting_battery_soc; 
         renogy_data.solar_panel_watts = sim_starting_solar_panel_watts;
@@ -789,7 +948,9 @@ void renogy_read_info_registers()
     renogy_info.voltage_rating = raw_data/256; 
     renogy_info.amp_rating = raw_data%256;
     renogy_info.wattage_rating = renogy_info.voltage_rating * renogy_info.amp_rating;
-    //Serial.println("raw ratings = " + String(raw_data));
+    //AppendStatus("raw = " + String(raw_data));
+    //AppendStatus("raw volt = " + String(raw_data/256.0));
+    //AppendStatus("raw amp = " + String(raw_data%256));
     //Serial.println("Voltage rating: " + String(renogy_info.voltage_rating));
     //Serial.println("amp rating: " + String(renogy_info.amp_rating));
 
