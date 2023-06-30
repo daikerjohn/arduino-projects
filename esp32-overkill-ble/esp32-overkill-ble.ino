@@ -96,6 +96,9 @@ String boot_time_str = "";
 // Variable to store the HTTP request
 String header;
 String status_str = "";
+const int STATUS_BUFFER_SIZE = 1500;
+char stat_char[STATUS_BUFFER_SIZE] = "";
+
 String http_status_str = "";
 String last_data_capture = "";
 
@@ -222,6 +225,7 @@ Controller_info renogy_info;
 void AppendStatus(String asdf) {
   Serial.println(asdf);
   status_str += "<p>" + String(asdf) + "</p>\n";
+  sprintf(stat_char, "%s<p>%s</p>\n", stat_char, asdf.c_str());
 }
 
 template<typename T, int MaxLen, typename Container = std::deque<T>>
@@ -407,7 +411,7 @@ void setup() {
   delay(500);
 
   bleStartup();
-  boot_time_str = String(getTimestamp());
+  boot_time_str = getTimestamp();
 }
 
 String structToString(){
@@ -668,7 +672,7 @@ String rawIndex(bool asPlaintext = true) {
 
 void turn_off_load(String decision) {
   if (decision != "") {
-    automatic_decision = decision + " @ " + String(getTimestamp());
+    automatic_decision = decision + " @ " + getTimestamp();
     automatic_decisions.push(automatic_decision);
     AppendStatus(automatic_decision);
   }
@@ -677,7 +681,7 @@ void turn_off_load(String decision) {
 
 void power_on_load(String decision) {
   if (decision != "") {
-    automatic_decision = decision + " @ " + String(getTimestamp());
+    automatic_decision = decision + " @ " + getTimestamp();
     automatic_decisions.push(automatic_decision);
     AppendStatus(automatic_decision);
   }
@@ -839,7 +843,7 @@ void harvest_data() {
 }
 
 void update_decisions(bool allow_automatic) {
-  AppendStatus("Current Time: " + String(getTimestamp()));
+  AppendStatus("Current Time: " + getTimestamp());
   if (!BLE_client_connected && !simulator_mode) {
     AppendStatus("Controller is not connected. No decisions will be made");
     return;
@@ -1002,8 +1006,6 @@ void update_decisions(bool allow_automatic) {
 }
 
 void loop() {
-  //status_str = "";
-
   if (first_loop) {
     Serial.println("Entering loop");
   }
@@ -1036,7 +1038,7 @@ void loop() {
       time_to_empty_queue.push(time_to_empty_mins);
     }
     //}
-    last_data_capture = String(getTimestamp());
+    last_data_capture = getTimestamp();
 
     /*
     if(simulator_mode) {
@@ -1064,7 +1066,7 @@ void loop() {
   //Send an HTTP POST request every 10 minutes
   if ((currentMillis - lastWebTime) > timerWebDelayMS) {
     AppendStatus("Will POST HTTP");
-    http_status_str = "Will POST HTTP @ " + String(getTimestamp()) + "\n";
+    http_status_str = "Will POST HTTP @ " + getTimestamp() + "\n";
     //Check WiFi connection status
     if (WiFi.status() == WL_CONNECTED) {
       if (BLE_client_connected) {
