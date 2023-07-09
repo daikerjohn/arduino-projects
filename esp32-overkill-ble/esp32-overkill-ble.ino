@@ -22,11 +22,14 @@ known bugs:
 
 #define TRACE
 //#include <Arduino.h>
-#include "BLEDevice.h"
+//#include "BLEDevice.h"
+#include "NimBLEDevice.h"
 #include "mydatatypes.h"
 //#include <Wire.h>
 
 HardwareSerial commSerial(0);
+
+static BLEClient *pClient;
 
 //---- global variables ----
 
@@ -60,6 +63,7 @@ bool newPacketReceived = false;
 
 //#include <AsyncTCP.h>
 #include <ESPAsyncWebSrv.h>
+#include <ArduinoJson.h>
 
 #ifdef ESP8266
 #include <Updater.h>
@@ -99,7 +103,9 @@ String status_str = "";
 const int STATUS_BUFFER_SIZE = 1500;
 char stat_char[STATUS_BUFFER_SIZE] = "";
 
-String http_status_str = "";
+float latest_hashrate = 0.0;
+String str_ble_status = "";
+String str_http_status = "";
 String last_data_capture = "";
 
 //For UTC -8.00 : -8 * 60 * 60 : -28800
@@ -223,9 +229,9 @@ Controller_info renogy_info;
 */
 
 void AppendStatus(String asdf) {
-  Serial.println(asdf);
-  status_str += "<p>" + String(asdf) + "</p>\n";
-  sprintf(stat_char, "%s<p>%s</p>\n", stat_char, asdf.c_str());
+  //Serial.println(asdf);
+  //status_str += "<p>" + String(asdf) + "</p>\n";
+  snprintf(stat_char+strlen(stat_char),  STATUS_BUFFER_SIZE-strlen(stat_char), "<p>%s</p>\n", asdf.c_str());
 }
 
 template<typename T, int MaxLen, typename Container = std::deque<T>>
@@ -284,7 +290,7 @@ bool simulator_mode = false;
 
 int battery_voltage = 12;
 int batt_cap_ah = 280;
-float max_battery_discharge = .2;
+//float max_battery_discharge = .2;
 
 float batt_volt_min = 11.5;
 float bat_volt_start = 12.5;
@@ -333,7 +339,8 @@ void setup() {
 
   pinMode(RELAY_PIN, OUTPUT);
 
-  renogy_control_load(0);
+  //renogy_control_load(0);
+  turn_off_load("Load Off - Startup");
 
   prefs.begin("solar-app", false);
   batt_cap_ah = prefs.getInt("batt_cap_ah", 50);
@@ -453,8 +460,11 @@ String structToString(){
     asdf += "\"last_update_time\": " + String(myData.last_update_time) + ",";
     asdf += "\"controller_connected\": " + String(myData.controller_connected);
     */
+    if (latest_hashrate > 0.0) {
+      asdf += "\"latest_hashrate\": " + String(latest_hashrate, 3) + ",";
+    }
     asdf += "\"controller_connected\": " + String(BLE_client_connected);
-    
+
     asdf += "}";
     return asdf;
 }
@@ -509,6 +519,7 @@ String htmlHead(bool includeReload = true) {
 String htmlFoot() {
   String data = "<p>Compiled: " + String(compile_date) + "</p>";
   data += "<p><a href='/'>Home</a> | <a href='/raw'>raw</a> | <a href='/json'>json</a> | <a href='/config'>Config</a> | <a href='/update'>Update</a> | <a href='/restart'>restart</a></p>";
+  data += "<p><a href='/ble'>BLE</a> | <a href='/bledisc'>BLE Disconn</a> | <a href='/bleconn'>BLE Connect</a> | <a href='/bleclearstr'>BLE ClearString</a></p>";
   data += "</body></html>";
   return data;
 }
@@ -543,6 +554,8 @@ String statsIndex() {
     data += "<p>Current: " + String(current_status) + "</p>";
   }
   data += "<p>" + String(status_str) + "</p>";
+  data += "<p>***" + String(stat_char) + "***</p>";
+
   // If the load_running is on, it displays the OFF button
   if (load_running) {
     data += "<p><a href=\"/load/off\"><button class=\"button button2\">OFF</button></a></p>";
@@ -692,23 +705,31 @@ void handle_webserver_connection() {
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
     //harvest_data();
     status_str = "";
+    stat_char[0] = '\0';
     update_decisions(false);
     request->send(200, "text/html", statsIndex());
+  });
+  server.on("/ble", HTTP_GET, [](AsyncWebServerRequest *request) {
+    //harvest_data();
+    //update_decisions(false);
+    request->send(200, "text/plain", str_ble_status);
   });
   server.on("/http", HTTP_GET, [](AsyncWebServerRequest *request) {
     //harvest_data();
     //update_decisions(false);
-    request->send(200, "text/html", http_status_str);
+    request->send(200, "text/html", str_http_status);
   });
   server.on("/raw", HTTP_GET, [](AsyncWebServerRequest *request) {
     //harvest_data();
     status_str = "";
+    stat_char[0] = '\0';
     update_decisions(false);
     request->send(200, "text/plain", rawIndex(true));
   });
   server.on("/json", HTTP_GET, [](AsyncWebServerRequest *request) {
     //harvest_data();
     status_str = "";
+    stat_char[0] = '\0';
     update_decisions(false);
     request->send(200, "text/plain", structToString());
   });
@@ -725,16 +746,37 @@ void handle_webserver_connection() {
 
   server.on("/config", HTTP_GET, [](AsyncWebServerRequest *request) {
     status_str = "";
+    stat_char[0] = '\0';
     request->send(200, "text/html", configIndex());
   });
 
   // Load control
   server.on("/load/on", HTTP_GET, [](AsyncWebServerRequest *request) {
-    power_on_load("");
+    power_on_load("Load On - Manual");
     request->redirect("/");
   });
   server.on("/load/off", HTTP_GET, [](AsyncWebServerRequest *request) {
-    turn_off_load("");
+    turn_off_load("Load Off - Manual");
+    request->redirect("/");
+  });
+
+  server.on("/bleconn", HTTP_GET, [](AsyncWebServerRequest *request) {
+    str_ble_status += getTimestamp() + " - BLE - Connect\n";
+    bleStartup();
+    //turn_off_load("Load Off - Manual");
+    request->redirect("/");
+  });
+  server.on("/bleclearstr", HTTP_GET, [](AsyncWebServerRequest *request) {
+    str_ble_status = getTimestamp() + " - Clear Str\n";
+    request->redirect("/");
+  });
+
+  server.on("/bledisc", HTTP_GET, [](AsyncWebServerRequest *request) {
+    pClient->disconnect();
+    BLEDevice::deinit(true);
+    str_ble_status += getTimestamp() + " - BLE - Disconnect\n";
+    last_data_capture = "Disconnected";
+    //turn_off_load("Load Off - Manual");
     request->redirect("/");
   });
 
@@ -1015,15 +1057,19 @@ void loop() {
   if ((currentMillis - lastTime) > timerDelayMS || first_loop) {
     Serial.println("Updating data");
     status_str = "";
+    stat_char[0] = '\0';
     bleRequestData();
+    sendRequestToAstro();
     //if(allow_automatic) {
     //battery_voltage_queue.push(renogy_data.battery_voltage);
-    battery_voltage_queue.push((float)packBasicInfo.Volts / 1000);
-    //battery_soc_queue.push(renogy_data.battery_soc);
-    battery_soc_queue.push((float)packBasicInfo.CapacityRemainPercent);
-    //net_system_watts_queue.push((float)renogy_data.load_watts);
-    net_system_watts_queue.push((float)packBasicInfo.Watts);
-    net_system_amps_queue.push((float)packBasicInfo.Amps / 1000);
+    if((float)packBasicInfo.CapacityRemainPercent > 0.0) {
+      battery_voltage_queue.push((float)packBasicInfo.Volts / 1000);
+      //battery_soc_queue.push(renogy_data.battery_soc);
+      battery_soc_queue.push((float)packBasicInfo.CapacityRemainPercent);
+      //net_system_watts_queue.push((float)renogy_data.load_watts);
+      net_system_watts_queue.push((float)packBasicInfo.Watts);
+      net_system_amps_queue.push((float)packBasicInfo.Amps / 1000);
+    }
 
     int valid_data_points_battery_soc = 0;
     avg_batt_soc = battery_soc_queue.average(&valid_data_points_battery_soc, "Battery SOC");
@@ -1033,12 +1079,11 @@ void loop() {
 
     if(valid_data_points_battery_soc > num_data_points_decision && valid_data_points_net_amps > num_data_points_decision) {
       //float net_rate_ah = (float)packBasicInfo.Amps / 1000;
-      float time_to_empty_hrs = (((avg_batt_soc / 100.00) - (1 - max_battery_discharge)) * batt_cap_ah) / (net_avg_system_amps * -1.0);
+      float time_to_empty_hrs = (((avg_batt_soc / 100.00) - (batt_soc_min / 100.00)) * batt_cap_ah) / (net_avg_system_amps * -1.0);
       float time_to_empty_mins = time_to_empty_hrs * 60;
       time_to_empty_queue.push(time_to_empty_mins);
     }
     //}
-    last_data_capture = getTimestamp();
 
     /*
     if(simulator_mode) {
@@ -1066,7 +1111,7 @@ void loop() {
   //Send an HTTP POST request every 10 minutes
   if ((currentMillis - lastWebTime) > timerWebDelayMS) {
     AppendStatus("Will POST HTTP");
-    http_status_str = "Will POST HTTP @ " + getTimestamp() + "\n";
+    str_http_status = "Will POST HTTP @ " + getTimestamp() + "\n";
     //Check WiFi connection status
     if (WiFi.status() == WL_CONNECTED) {
       if (BLE_client_connected) {
@@ -1089,26 +1134,26 @@ void loop() {
         String httpRequestData = structToString();
         Serial.println("POSTing http data:");
         Serial.println(httpRequestData);
-        http_status_str += "\n";
-        http_status_str += httpRequestData;
-        http_status_str += "\n";
+        str_http_status += "\n";
+        str_http_status += httpRequestData;
+        str_http_status += "\n";
         int httpResponseCode = theHttpClient.POST(httpRequestData);
         //int httpResponseCode = 200;
 
         Serial.print("HTTP Response code: ");
         AppendStatus("Latest Posting Reponse Code: " + String(httpResponseCode));
-        http_status_str += "Latest Posting Reponse Code: " + String(httpResponseCode);
+        str_http_status += "Latest Posting Reponse Code: " + String(httpResponseCode);
 
         // Free resources
         theHttpClient.end();
         lastWebTime = millis();
       } else {
         AppendStatus("Latest Posting Reponse: No BLE");
-        http_status_str += "Lastest Posting Response: No BLE";
+        str_http_status += "Lastest Posting Response: No BLE";
       }
     } else {
       AppendStatus("Latest Posting Reponse: No WiFi");
-      http_status_str += "Lastest Posting Response: No WiFi";
+      str_http_status += "Lastest Posting Response: No WiFi";
     }
   }
 
@@ -1347,4 +1392,51 @@ void renogy_control_load(bool state) {
   next_available_startup = millis() + shut_cool_ms;
   //if (state==1) node.writeSingleRegister(0x010A, 1);  // turn on load
   //else node.writeSingleRegister(0x010A, 0);  // turn off load
+}
+
+void sendRequestToAstro() {
+  WiFiClient localClient;
+  // Astrominer API
+  const uint port = 60666;
+  const char* ip = "192.168.30.155";
+  latest_hashrate = 0.0;
+
+  if (localClient.connect(ip, port)) {
+    if (localClient.connected()) {
+      // send data.  The println is important here!
+      localClient.println('A');
+      Serial.println("[Tx] A");
+      delay(500);
+    }
+
+    // check if response is waiting for us
+    if (localClient.available() > 0) {
+      String str = localClient.readStringUntil('\n');  // read entire response
+      Serial.print("[Rx] ");
+      Serial.println(str);
+      str_http_status += str;
+
+      String json = "{" + str + "}";
+      StaticJsonDocument<200> doc;
+      // Deserialize the JSON document
+      DeserializationError error = deserializeJson(doc, json);
+
+      // Test if parsing succeeds.
+      if (error) {
+        Serial.print(F("deserializeJson() failed: "));
+        Serial.println(error.f_str());
+        return;
+      } else {
+        String thing = doc["hs"];
+        Serial.println(thing);
+        thing.replace("[", "");
+        thing.replace("]", "");
+        Serial.println(thing);
+        latest_hashrate = thing.toFloat();
+        Serial.println(latest_hashrate);
+      }
+    } else {
+      Serial.print("Response not ready yet");
+    }
+  }
 }

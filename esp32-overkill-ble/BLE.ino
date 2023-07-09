@@ -14,22 +14,23 @@ static BLEUUID charUUID_rx("0000ff01-0000-1000-8000-00805f9b34fb"); //xiaoxiang 
 // Write this characteristic to send data to BMS
 // READ, WRITE, WRITE NO RESPONSE
 
-class MyAdvertisedDeviceCallbacks : public BLEAdvertisedDeviceCallbacks
+class MyAdvertisedDeviceCallbacks : public NimBLEAdvertisedDeviceCallbacks
 { //this is called by some underlying magic
     /**
 	* Called for each advertising BLE server.
 	*/
-    void onResult(BLEAdvertisedDevice advertisedDevice)
+    void onResult(NimBLEAdvertisedDevice* advertisedDevice)
     {
         commSerial.print("BLE Advertised Device found: ");
-        commSerial.println(advertisedDevice.toString().c_str());
+        commSerial.println(advertisedDevice->toString().c_str());
+        str_ble_status += getTimestamp() + " - onResult " + advertisedDevice->toString().c_str() + "\n";
 
         // We have found a device, let us now see if it contains the service we are looking for.
-        if (advertisedDevice.haveServiceUUID() && advertisedDevice.isAdvertisingService(serviceUUID))
+        if (advertisedDevice->haveServiceUUID() && advertisedDevice->isAdvertisingService(serviceUUID))
         {
 
-            BLEDevice::getScan()->stop();
-            myDevice = new BLEAdvertisedDevice(advertisedDevice);
+            NimBLEDevice::getScan()->stop();
+            myDevice = advertisedDevice;
             doConnect = true;
             doScan = true;
 
@@ -41,11 +42,13 @@ class MyClientCallback : public BLEClientCallbacks
 
     void onConnect(BLEClient *pclient)
     {
+      str_ble_status += getTimestamp() + " - onConnect\n";
     }
 
     void onDisconnect(BLEClient *pclient)
     {
         BLE_client_connected = false;
+        str_ble_status += getTimestamp() + " - onDisconnect\n";
         commSerial.println("onDisconnect");
     }
 };
@@ -62,6 +65,7 @@ void bleRequestData()
         if (connectToServer())
         {
             commSerial.println("We are now connected to the BLE Server.");
+            str_ble_status += getTimestamp() + " - Connected\n";
             doConnect = false;
         }
     }
@@ -90,6 +94,7 @@ void bleRequestData()
             }
             toggle = !toggle;
         }
+        last_data_capture = getTimestamp();
     }
     else if (doScan)
     {
@@ -105,14 +110,18 @@ void bleRequestData()
 void bleStartup()
 {
 #ifndef SIMULATION
+    doConnect = false;
+    BLE_client_connected = false;
+    doScan = false;
 
     TRACE;
     BLEDevice::init("");
+    str_ble_status += getTimestamp() + " - BLEDevice::init('')\n";
 
     // Retrieve a Scanner and set the callback we want to use to be informed when we
     // have detected a new device.  Specify that we want active scanning and start the
     // scan to run for 5 seconds.
-    BLEScan *pBLEScan = BLEDevice::getScan();
+    NimBLEScan *pBLEScan = BLEDevice::getScan();
     pBLEScan->setAdvertisedDeviceCallbacks(new MyAdvertisedDeviceCallbacks());
     pBLEScan->setInterval(1349);
     pBLEScan->setWindow(449);
@@ -134,7 +143,7 @@ bool connectToServer()
     TRACE;
     commSerial.print("Forming a connection to ");
     commSerial.println(myDevice->getAddress().toString().c_str());
-    BLEClient *pClient = BLEDevice::createClient();
+    pClient = NimBLEDevice::createClient();
     commSerial.println(" - Created client");
     pClient->setClientCallbacks(new MyClientCallback());
 
@@ -173,14 +182,15 @@ bool connectToServer()
 
     if (pRemoteCharacteristic->canNotify()) {
 		    commSerial.print("The Device can notify");
-        pRemoteCharacteristic->registerForNotify(notifyCallback);
+        //pRemoteCharacteristic->registerForNotify(notifyCallback);
+        pRemoteCharacteristic->subscribe(true, notifyCallback);
     }
 
     BLE_client_connected = true;
     return BLE_client_connected;
 }
 
-void sendCommand(uint8_t *data, uint32_t dataLen)
+void sendCommand(uint8_t *data, size_t dataLen)
 {
     TRACE;
 
@@ -188,7 +198,7 @@ void sendCommand(uint8_t *data, uint32_t dataLen)
 
     if (pRemoteCharacteristic)
     {
-        pRemoteCharacteristic->writeValue(data, dataLen);
+        pRemoteCharacteristic->writeValue(data, dataLen, false);
         //commSerial.println("bms request sent");
     }
     else
