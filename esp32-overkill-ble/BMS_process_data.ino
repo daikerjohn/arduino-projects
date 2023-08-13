@@ -151,7 +151,7 @@ bool bmsProcessPacket(byte *packet)
 
     if (isValid != true)
     {
-        commSerial.println("Invalid packer received");
+        //commSerial.println("Invalid packer received");
         return false;
     }
 
@@ -181,7 +181,7 @@ bool bmsProcessPacket(byte *packet)
 
     default:
         result = false;
-        commSerial.printf("Unsupported packet type detected. Type: %d", pHeader->type);
+        //commSerial.printf("Unsupported packet type detected. Type: %d", pHeader->type);
     }
 
     return result;
@@ -249,6 +249,7 @@ void bmsGetInfo4()
     //commSerial.println("Request info4 sent");
 }
 
+/*
 void printBasicInfo() //debug all data to uart
 {
     TRACE;
@@ -282,17 +283,18 @@ void printCellInfo() //debug all data to uart
     commSerial.printf("Median cell volt: %f\n", (float)packCellInfo.CellMedian / 1000);
     commSerial.println();
 }
+*/
 
 void hexDump(const char *data, uint32_t dataSize) //debug function
 {
     TRACE;
-    commSerial.println("HEX data:");
+    //commSerial.println("HEX data:");
 
     for (int i = 0; i < dataSize; i++)
     {
-        commSerial.printf("0x%x, ", data[i]);
+        //commSerial.printf("0x%x, ", data[i]);
     }
-    commSerial.println("");
+    //commSerial.println("");
 }
 
 int16_t two_ints_into16(int highbyte, int lowbyte) // turns two bytes into a single long integer

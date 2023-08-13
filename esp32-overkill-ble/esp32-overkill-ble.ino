@@ -20,6 +20,113 @@ known bugs:
 -reconnection sort of works, sometimes ESP reboots
 */
 
+#include <ModbusMaster.h>
+#include <RunningAverage.h>
+#include <TelnetPrint.h>
+
+#define RS485_TX 1
+#define RS485_RX 3
+
+#include "TracerData.h"
+#include "EpeverTracer.h"
+
+EpeverTracer tracer;
+
+/*
+"Real-time data" and "Real-time status" registers
+    PV array voltage             3100
+    PV array current             3101
+    PV array power               3102-3103
+    Battery voltage              3104
+    Battery charging current     3105
+    Battery charging power       3106-3107
+    Load voltage                 310C
+    Load current                 310D
+    Load power                   310E-310F
+    Battery temperature          3110
+    Internal temperature         3111
+    Heat sink temperature        3112
+    Battery SOC                  311A
+    Remote battery temperature   311B
+    System rated voltage         311C
+    Battery status               3200
+    Charging equipment status    3201
+    Discharging equipment status 3202
+*/
+#define PANEL_VOLTS      0x00
+#define PANEL_AMPS       0x01
+#define PANEL_POWER_L    0x02
+#define PANEL_POWER_H    0x03
+#define BATT_VOLTS       0x04
+#define BATT_AMPS        0x05
+#define BATT_POWER_L     0x06
+#define BATT_POWER_H     0x07
+#define LOAD_VOLTS       0x0C
+#define LOAD_AMPS        0x0D
+#define LOAD_POWER_L     0x0E
+#define LOAD_POWER_H     0x0F
+#define BATT_TEMP        0x10
+#define INT_TEMP         0x11
+#define HEATSINK_TEMP    0x12
+#define BATT_SOC         0x1A
+#define REMOTE_BATT_TEMP 0x1B
+
+const int realtimeMetrics = 11; //The number of realtime metrics we'll be collecting.
+float realtime[realtimeMetrics];
+
+byte avSamples = 10;
+int failures = 0; //The number of failed WiFi or HTTP post attempts. Will automatically restart the ESP if too many failures occurr in a row.
+
+RunningAverage realtimeAverage[realtimeMetrics] = {
+  RunningAverage(avSamples),
+  RunningAverage(avSamples),
+  RunningAverage(avSamples),
+  RunningAverage(avSamples),
+  RunningAverage(avSamples),
+  RunningAverage(avSamples),
+  RunningAverage(avSamples),
+  RunningAverage(avSamples),
+  RunningAverage(avSamples),
+  RunningAverage(avSamples),
+  RunningAverage(avSamples)
+};
+
+byte collectedSamples = 0;
+unsigned long lastUpdate = 0;
+
+const char *realtimeMetricNames[] = {"PV_array_voltage",
+                       "PV_array_current",
+                       "PV_array_power",
+                       "Battery_voltage",
+                       "Battery_charging_current",
+                       "Battery_charging_power",
+                       "Load_voltage",
+                       "Load_current",
+                       "Load_power",
+                       "Battery_temperature",
+                       "Internal_temperature"};
+
+/*
+"Statistical parameter registers
+    Max input voltage today      3300
+    Min input voltage today      3301
+    Max battery voltage today    3302
+    Min battery voltage today    3303
+    Consumed energy today        3304-3305
+    Consumed energy this month   3306-3307
+    Consumed energy this year    3308-3309
+    Total consumed energy        330A-330B
+    Generated energy today       330C-330D
+    Generated energy this moth   330E-330F
+    Generated energy this year   3310-3311
+    Total generated energy       3312-3313
+    Carbon dioxide reduction     3314-3315
+    Battery voltage              331A
+    Net battery current          331B-331C
+    Battery temperature          331D
+    Ambient temperature          331E
+*/
+
 #define TRACE
 //#include <Arduino.h>
 //#include "BLEDevice.h"
@@ -27,7 +134,7 @@ known bugs:
 #include "mydatatypes.h"
 //#include <Wire.h>
 
-HardwareSerial commSerial(0);
+//HardwareSerial commSerial(0);
 
 static BLEClient *pClient;
 
@@ -120,6 +227,7 @@ String ssid_str = "";
 String password_str = "";
 
 bool allow_auto = false;
+bool ble_autoconn = false;
 
 //const char *ssid = "TP-Link_7536";
 //const char *password = "07570377";
@@ -329,8 +437,13 @@ FixedQueue<float, num_data_points_sma> battery_soc_queue;
 FixedQueue<float, num_data_points_sma> battery_voltage_queue;
 FixedQueue<String, num_data_points_sma> automatic_decisions;
 
-void notFound(AsyncWebServerRequest *request) {
+void notFoundResp(AsyncWebServerRequest *request) {
   request->send(404, "text/plain", "Not found");
+}
+
+template <class T>
+String pnSuffix(T inp) {
+  return String(inp > 0 ? "+" : "");
 }
 
 void setup() {
@@ -343,6 +456,9 @@ void setup() {
   turn_off_load("Load Off - Startup");
 
   prefs.begin("solar-app", false);
+  size_t whatsLeft = prefs.freeEntries();    // this method works regardless of the mode in which the namespace is opened.
+  str_ble_status += String(whatsLeft);
+
   batt_cap_ah = prefs.getInt("batt_cap_ah", 50);
   batt_soc_min = prefs.getInt("batt_soc_min", 50);
   batt_soc_start = prefs.getInt("batt_soc_start", 65);
@@ -355,6 +471,14 @@ void setup() {
   password_str = prefs.getString("password", "alphabit");
 
   allow_auto = prefs.getBool("allow_auto", false);
+  // Initial setup if key does not exist
+  if (!prefs.isKey("ble_autoconn")) {
+    str_ble_status += "Creating initial key!\n";
+    if (prefs.putBool("ble_autoconn", false) != 1) {
+      str_ble_status += "Error putting key initial key!\n";
+    }
+  }
+  ble_autoconn = prefs.getBool("ble_autoconn", false);
   /*
   if(ssid == "" || strlen(ssid) < 3) {
     Serial.println("Setting default ssid...");
@@ -381,28 +505,23 @@ void setup() {
   WiFi.begin(ssid_str.c_str(), password_str.c_str());
   //WiFi.begin("Wokwi-GUEST", "", 6);
   while (WiFi.status() != WL_CONNECTED) {
-    delay(2500);
+    delay(500);
     Serial.println("connecting...");
     Serial.println(ssid_str);
     Serial.println(password_str);
   }
 
+  //Telnet log is accessible at port 23
+  TelnetPrint.begin();
+
   Serial.println("");
   Serial.println("WiFi connected");
   Serial.print("IP address: ");
   Serial.println(WiFi.localIP());
-  delay(500);
+  delay(100);
 
   configTime(gmtOffset_sec, daylightOffset_sec, "pool.ntp.org");
   //configTime(0, 0, "pool.ntp.org");
-
-  // create a second serial interface for modbus
-  //Serial2.begin(9600, SERIAL_8N1, RXD2, TXD2);
-
-  // my Renogy Wanderer has an (slave) address of 255! Not in docs???
-  // Do all Renogy charge controllers use this address?
-  //int modbus_address = 255;
-  //node.begin(modbus_address, Serial2);
 
   AsyncElegantOTA.begin(&server);  // Start AsyncElegantOTA
 
@@ -411,17 +530,21 @@ void setup() {
   // Start webserver
   server.begin();
 
-  commSerial.begin(115200, SERIAL_8N1, 3, 1);
-  delay(3000);
-  commSerial.println("Starting ebike dashboard application...");
+  TelnetPrint.println("Starting Solar monitoring application...");
 
-  delay(500);
+  delay(100);
 
-  bleStartup();
+  str_ble_status += "BLE Autoconn: " + String(ble_autoconn);
+  if (ble_autoconn) {
+    bleStartup();
+  }
+
+  tracer.begin();
+
   boot_time_str = getTimestamp();
 }
 
-String structToString(){
+String structToString() {
     String asdf = "{";
 
     asdf += "\"battery_soc\": " + String(packBasicInfo.CapacityRemainPercent) + ",";
@@ -430,6 +553,38 @@ String structToString(){
     asdf += "\"battery_temperature\": " + String((float)packBasicInfo.Temp1 / 10) + ",";
     asdf += "\"battery_watts_net\": " + String((float)packBasicInfo.Watts) + ",";
     asdf += "\"controller_temperature\": " + String((float)packBasicInfo.Temp2 / 10) + ",";
+
+    if (tracer.update()) {
+      TracerData *data = tracer.getData();
+      if (data->everythingRead) {
+        TelnetPrint.println("MODBUS everything read!");
+        asdf += "\"solar_panel_voltage\": " + String(data->realtimeData.pvVoltage) + ",";
+        asdf += "\"solar_panel_amps\": " + String(data->realtimeData.pvCurrent) + ",";
+        asdf += "\"solar_panel_watts\": " + String(data->realtimeData.pvPower) + ",";
+
+        asdf += "\"solar_charging_voltage\": " + String(data->realtimeData.batteryVoltage) + ",";
+        asdf += "\"solar_charging_amps\": " + String(data->realtimeData.batteryChargingCurrent) + ",";
+        asdf += "\"solar_charging_watts\": " + String(data->realtimeData.batteryChargingPower) + ",";
+
+        TelnetPrint.print("pvPower: ");
+        TelnetPrint.println(data->realtimeData.pvPower);
+        TelnetPrint.print("pvCurrent: ");
+        TelnetPrint.println(data->realtimeData.pvCurrent);
+        TelnetPrint.print("pvVoltage: ");
+        TelnetPrint.println(data->realtimeData.pvVoltage);
+
+        TelnetPrint.print("batteryChargingPower: ");
+        TelnetPrint.println(data->realtimeData.batteryChargingPower);
+        TelnetPrint.print("batteryChargingCurrent: ");
+        TelnetPrint.println(data->realtimeData.batteryChargingCurrent);
+        TelnetPrint.print("batteryVoltage: ");
+        TelnetPrint.println(data->realtimeData.batteryVoltage);
+      } else {
+        TelnetPrint.println("MODBUS missing something...");
+      }
+    }
+
+
     /*
     asdf += "\"load_voltage\": " + String(myData.load_voltage) + ",";
     asdf += "\"load_amps\": " + String(myData.load_amps) + ",";
@@ -589,6 +744,9 @@ String configIndex() {
   data += "<input type=\"submit\" value=\"Submit\"></form>";
 
   data += "<form action=\"/set\">Allow Automatic: <input type=\"text\" name=\"allow_auto\" value=\"" + String(allow_auto) + "\"><br/>";
+  data += "<input type=\"submit\" value=\"Submit\"></form>";
+
+  data += "<form action=\"/set\">BLE Auto Connect: <input type=\"text\" name=\"ble_autoconn\" value=\"" + String(ble_autoconn) + "\"><br/>";
   data += "<input type=\"submit\" value=\"Submit\"></form>";
 
   data += htmlFoot();
@@ -772,8 +930,13 @@ void handle_webserver_connection() {
   });
 
   server.on("/bledisc", HTTP_GET, [](AsyncWebServerRequest *request) {
+
     pClient->disconnect();
-    BLEDevice::deinit(true);
+    BLEDevice::deinit(false);
+    doConnect = false;
+    BLE_client_connected = false;
+    doScan = false;
+
     str_ble_status += getTimestamp() + " - BLE - Disconnect\n";
     last_data_capture = "Disconnected";
     //turn_off_load("Load Off - Manual");
@@ -787,7 +950,8 @@ void handle_webserver_connection() {
     if (request->hasArg("batt_cap_ah") || request->hasArg("batt_soc_min") || request->hasArg("batt_soc_start") || request->hasArg("batt_volt_min") || request->hasArg("bat_volt_start") || request->hasArg("shut_cool_ms")
         || request->hasArg("ssid")
         || request->hasArg("password")
-        || request->hasArg("allow_auto")) {
+        || request->hasArg("allow_auto")
+        || request->hasArg("ble_autoconn")) {
       if (prefs.begin("solar-app", false)) {
         if (request->hasArg("batt_cap_ah")) {
           input_value = request->arg("batt_cap_ah");
@@ -835,6 +999,14 @@ void handle_webserver_connection() {
           allow_auto = std::stoi(input_value.c_str());
           prefs.putBool("allow_auto", allow_auto);
         }
+        if (request->hasArg("ble_autoconn")) {
+          input_value = request->arg("ble_autoconn");
+          //str_ble_status += "input_value ble_autoconn = " + String(input_value);
+          ble_autoconn = std::stoi(input_value.c_str());
+          //str_ble_status += "storing ble_autoconn = " + String(ble_autoconn);
+          prefs.putBool("ble_autoconn", ble_autoconn);
+        }
+        delay(100);
         prefs.end();
       } else {
         request->send(200, "text/plain", "Failed to being() prefs for write");
@@ -843,7 +1015,7 @@ void handle_webserver_connection() {
     request->redirect("/config");
   });
 
-  server.onNotFound(notFound);
+  server.onNotFound(notFoundResp);
 }
 
 String getTimestamp() {
@@ -908,17 +1080,19 @@ void update_decisions(bool allow_automatic) {
   //float time_to_empty_mins = time_to_empty_hrs * 60;
   //time_to_empty_queue.push(time_to_empty_mins);
 
+/*
   if (allow_automatic) {
     if (valid_data_points_load_watts > num_data_points_decision) {
       if (net_avg_system_watts < 0.1) {
         load_running = true;
       }
-    } else {
-      if (load_running && net_avg_system_watts == 0 && BLE_client_connected) {
-        load_running = false;
-      }
+    //} else {
+    //  if (load_running && net_avg_system_watts == 0 && BLE_client_connected) {
+    //    load_running = false;
+    //  }
     }
   }
+  */
 
   if (valid_data_points_battery_voltage > num_data_points_decision && valid_data_points_battery_soc > num_data_points_decision) {
     if (load_running && avg_batt_volts < batt_volt_min) {
@@ -942,7 +1116,7 @@ void update_decisions(bool allow_automatic) {
           if (avg_batt_volts > bat_volt_start) {
             if (avg_batt_soc > batt_soc_start) {
               if (next_available_startup != 0 && millis() > next_available_startup) {
-                if (allow_automatic) {
+                if (allow_automatic && net_avg_system_amps > 0) {
                   power_on_load("Turn on load");
                 }
                 current_status = "";
@@ -982,10 +1156,10 @@ void update_decisions(bool allow_automatic) {
 
   if (valid_data_points_load_watts > num_data_points_decision) {
     float load_outgoing_rate_ah = net_avg_system_watts / (battery_voltage * 1.0);
-    AppendStatus("Load is consuming " + String(load_outgoing_rate_ah) + " ah (c) and " + String(net_avg_system_watts) + " watts (r)");
+    AppendStatus("Net load is " + pnSuffix(load_outgoing_rate_ah) + String(load_outgoing_rate_ah) + " ah (c) @ " + String(battery_voltage) + "v (" + String(net_avg_system_watts) + " watts)");
 
     //float charging_rate_ah = panel_incoming_rate_ah - load_outgoing_rate_ah;
-    AppendStatus("Net System Rate is " + String(net_avg_system_amps) + " ah (c)");
+    AppendStatus("Net System Rate is " + pnSuffix(net_avg_system_amps) + String(net_avg_system_amps) + " ah (c) @ " + String(avg_batt_volts) + "v");
 
     if (net_avg_system_amps == 0) {
       AppendStatus("Battery is holding steady");
@@ -1026,16 +1200,27 @@ void update_decisions(bool allow_automatic) {
       */
 
       AppendStatus("Battery is discharging at " + String(net_avg_system_amps) + " ah");
-      if ((avg_time_to_empty_mins < 60 && valid_data_points_tte > num_data_points_decision)) {
-        AppendStatus("At that rate it will be empty in " + String(avg_time_to_empty_mins) + " minutes");
-        if (avg_time_to_empty_mins < 15) {
-          if (allow_automatic) {
-            turn_off_load("Battery will be dead in less than 15 minutes!  Kill the load!" + String(avg_time_to_empty_mins) + " to go");
+      if (valid_data_points_tte > num_data_points_decision) {
+        AppendStatus("Battery will be empty in " + String(avg_time_to_empty_mins/60) + " hours (" + String(avg_time_to_empty_mins) + " min)");
+        /*
+        if (avg_time_to_empty_mins > 0) {
+          if (avg_time_to_empty_mins < 60) {
+            //if (load_running && avg_time_to_empty_mins < 60) {
+            //  if (allow_automatic) {
+            //    turn_off_load("Battery will be dead in less than 60 minutes!  Kill the load! " + String(avg_time_to_empty_mins) + " to go");
+            //  }
+            //  //AppendStatus("Battery will be dead in less than 30 minutes!  Kill the load!");
+            //}
+          } else {
+            // No-op. Running normally but discharging.
           }
-          //AppendStatus("Battery will be dead in less than 30 minutes!  Kill the load!");
+        } else {
+          AppendStatus("Should not see this? net_avg_system_amps says discharging but avg_time_to_empty_mins says charging");
         }
+        */
       } else {
-        AppendStatus("At that rate it will be empty in " + String(avg_time_to_empty_mins / 60) + " hours");
+        //AppendStatus("At that rate it will be empty in " + String(avg_time_to_empty_mins / 60) + " hours");
+        AppendStatus("Not enough data points");
       }
     }
   } else {
@@ -1060,6 +1245,7 @@ void loop() {
     stat_char[0] = '\0';
     bleRequestData();
     sendRequestToAstro();
+    requestFromEPEver();
     //if(allow_automatic) {
     //battery_voltage_queue.push(renogy_data.battery_voltage);
     if((float)packBasicInfo.CapacityRemainPercent > 0.0) {
@@ -1160,10 +1346,15 @@ void loop() {
   first_loop = false;
 
   //server.handleClient();
+  /*
   if (newPacketReceived == true) {
     printBasicInfo();
     printCellInfo();
   }
+  */
+  // I think this just has to run all the time?
+  tracer.update();
+  getMeasuredUsage();
 }
 
 
@@ -1439,4 +1630,173 @@ void sendRequestToAstro() {
       Serial.print("Response not ready yet");
     }
   }
+}
+
+void requestFromEPEver() {
+  //float rssi = WiFi.RSSI();
+  //Serial.print("WiFi signal strength is: "); Serial.println(rssi);
+  //TelnetPrint.print("WiFi signal strength is: "); TelnetPrint.println(rssi);
+
+  TelnetPrint.println("Reading the EPEver...");
+
+  if (tracer.update()) {
+      TracerData *data = tracer.getData();
+      if (data->everythingRead) {
+          TelnetPrint.println("MODBUS everything read!");
+
+          TelnetPrint.print("pvPower: ");
+          TelnetPrint.println(data->realtimeData.pvPower);
+          TelnetPrint.print("pvCurrent: ");
+          TelnetPrint.println(data->realtimeData.pvCurrent);
+          TelnetPrint.print("pvVoltage: ");
+          TelnetPrint.println(data->realtimeData.pvVoltage);
+
+          TelnetPrint.print("batteryChargingPower: ");
+          TelnetPrint.println(data->realtimeData.batteryChargingPower);
+          TelnetPrint.print("batteryChargingCurrent: ");
+          TelnetPrint.println(data->realtimeData.batteryChargingCurrent);
+          TelnetPrint.print("batteryVoltage: ");
+          TelnetPrint.println(data->realtimeData.batteryVoltage);
+
+          TelnetPrint.print("equipmentTemp: ");
+          TelnetPrint.println(data->realtimeData.equipmentTemp);
+          TelnetPrint.print("heatsinkTemp: ");
+          TelnetPrint.println(data->realtimeData.heatsinkTemp);
+      } else {
+        TelnetPrint.println("MODBUS missing something...");
+      }
+      //delay(1000);
+  }
+
+  /*
+  uint8_t result;
+  Serial.flush(); //Make sure the hardware serial buffer is empty before communicating over MODBUS.
+
+  EPEver.clearResponseBuffer();
+  result = EPEver.readInputRegisters(0x3100, 18); // Read registers starting at 0x3100 for the realtime data.
+
+  if (result == EPEver.ku8MBSuccess) {
+    TelnetPrint.println("MODBUS read successful.");
+    for (int i = 0; i < realtimeMetrics; i++) {
+      realtime[i] = 0.0; //Clear all the metrics.
+      switch (i) {
+        case 0: //PV array voltage
+          realtime[i] = EPEver.getResponseBuffer(PANEL_VOLTS)/100.0f;
+          realtimeAverage[i].addValue(realtime[i]);
+          break;
+        case 1: //PV array current
+          realtime[i] = EPEver.getResponseBuffer(PANEL_AMPS)/100.0f;
+          realtimeAverage[i].addValue(realtime[i]);
+          break;
+        case 2: //PV array power
+          realtime[i] = (EPEver.getResponseBuffer(PANEL_POWER_L) | (EPEver.getResponseBuffer(PANEL_POWER_H) << 8))/100.0f;
+          realtimeAverage[i].addValue(realtime[i]);
+          break;
+        case 3: //Battery voltage
+          realtime[i] = EPEver.getResponseBuffer(BATT_VOLTS)/100.0f;
+          realtimeAverage[i].addValue(realtime[i]);
+          break;
+        case 4: //Battery charging current
+          realtime[i] = EPEver.getResponseBuffer(BATT_AMPS)/100.0f;
+          realtimeAverage[i].addValue(realtime[i]);
+          break;
+        case 5: //Battery charging power
+          realtime[i] = (EPEver.getResponseBuffer(BATT_POWER_L) | (EPEver.getResponseBuffer(BATT_POWER_H) << 8))/100.0f;
+          realtimeAverage[i].addValue(realtime[i]);
+          break;
+        case 6: //Load voltage
+          realtime[i] = EPEver.getResponseBuffer(LOAD_VOLTS)/100.0f;
+          realtimeAverage[i].addValue(realtime[i]);
+          break;
+        case 7: //Load current
+          realtime[i] = EPEver.getResponseBuffer(LOAD_AMPS)/100.0f;
+          realtimeAverage[i].addValue(realtime[i]);
+          break;
+        case 8: //Load power
+          realtime[i] = (EPEver.getResponseBuffer(LOAD_POWER_L) | (EPEver.getResponseBuffer(LOAD_POWER_H) << 8))/100.0f;
+          realtimeAverage[i].addValue(realtime[i]);
+          break;
+        case 9: //Battery temperature
+          realtime[i] = EPEver.getResponseBuffer(BATT_TEMP)/100.0f;
+          realtimeAverage[i].addValue(realtime[i]);
+          break;
+        case 10: //Internal temperature
+          realtime[i] = EPEver.getResponseBuffer(INT_TEMP)/100.0f;
+          realtimeAverage[i].addValue(realtime[i]);
+          break;
+      }
+
+      Serial.print(realtimeMetricNames[i]); Serial.print(": "); Serial.print(realtime[i]); Serial.print(" Average: "); Serial.println(realtimeAverage[i].getAverage());
+
+      char realtimeString[8];
+      dtostrf(realtime[i], 1, 2, realtimeString);
+
+      char realtimeAvString[8];
+      dtostrf(realtimeAverage[i].getAverage(), 1, 2, realtimeAvString);
+
+      TelnetPrint.print(realtimeMetricNames[i]); TelnetPrint.print(": "); TelnetPrint.print(realtimeString); TelnetPrint.print(" Average: "); TelnetPrint.println(realtimeAvString);
+
+      if (collectedSamples == avSamples) { //Once we've collected enough samples to flush the averages, send the data to InfluxDB.
+        TelnetPrint.println("Posting the data...");
+
+        #if defined (INFLUX_HTTP) || defined (INFLUX_UDP)
+          char post[70];
+          sprintf(post, "%s,sensor=solar value=%s", realtimeMetricNames[i], realtimeAvString);
+          sendInfluxData(post);
+        #endif
+      }
+      yield();
+    }
+
+    if (collectedSamples >= avSamples) {
+      TelnetPrint.print(collectedSamples); TelnetPrint.println(" samples have been collected. Resetting the counter."); TelnetPrint.println();
+      collectedSamples = 0;
+      TelnetPrint.println("Posting uptime data...");
+
+      char uptimeString[20];
+      dtostrf((millis()/60000), 1, 0, uptimeString); //Uptime in minutes.
+
+
+      #if defined (INFLUX_HTTP) || defined (INFLUX_UDP)
+        char post[70];
+        sprintf(post, "uptime,sensor=solar value=%s", uptimeString);
+        sendInfluxData(post);
+      #endif
+    } else {
+      collectedSamples++;
+      TelnetPrint.print(collectedSamples); TelnetPrint.println(" samples have been collected."); TelnetPrint.println();
+    }
+  } else {
+    Serial.print("MODBUS read failed. Returned value: ");
+    Serial.println(result, HEX);
+    TelnetPrint.print("MODBUS read failed. Returned value: "); TelnetPrint.println(result);
+    failures++;
+    TelnetPrint.print("Failure counter: "); TelnetPrint.println(failures);
+  }
+  */
+}
+
+void getMeasuredUsage() {
+  const int sensorIn = 35;      // pin where the OUT pin from sensor is connected on Arduino
+  //int mVperAmp = 185;           // this the 5A version of the ACS712 -use 100 for 20A Module and 66 for 30A Module
+  //int mVperAmp = 66;           // this the 5A version of the ACS712 -use 100 for 20A Module and 66 for 30A Module
+  //int Watt = 0;
+  //double Voltage = 0;
+  //double VRMS = 0;
+  //double AmpsRMS = 0;
+  TelnetPrint.print(analogRead(sensorIn)*(3.3/4095), 5);
+  TelnetPrint.println(" base voltage");
+  float ACSValue = 0.0, Samples = 0.0, AvgACS = 0.0, BaseVol = 1.52185; //Change BaseVol as per your reading in the first step.
+  for (int x = 0; x < 500; x++) { //This would take 500 Samples
+    ACSValue = analogRead(sensorIn);
+    Samples = Samples + ACSValue;
+    delay(3);
+  }
+  AvgACS = Samples/500;
+  TelnetPrint.print((((AvgACS) * (3.3 / 4095.0)) - BaseVol ), 5 ); //0.066V = 66mVol. This is sensitivity of your ACS module.
+  TelnetPrint.println(" Avg Volts");
+  //TelnetPrint.println( ((AvgACS - BaseVol) * (3.3 / 4095.0)) / 0.066 ); //0.066V = 66mVol. This is sensitivity of your ACS module.
+  TelnetPrint.print((((AvgACS) * (3.3 / 4095.0)) - BaseVol ) / 0.066, 5 ); //0.066V = 66mVol. This is sensitivity of your ACS module.
+  TelnetPrint.println(" amps");
+
 }

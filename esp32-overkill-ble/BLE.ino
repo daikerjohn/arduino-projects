@@ -21,8 +21,8 @@ class MyAdvertisedDeviceCallbacks : public NimBLEAdvertisedDeviceCallbacks
 	*/
     void onResult(NimBLEAdvertisedDevice* advertisedDevice)
     {
-        commSerial.print("BLE Advertised Device found: ");
-        commSerial.println(advertisedDevice->toString().c_str());
+        //commSerial.print("BLE Advertised Device found: ");
+        //commSerial.println(advertisedDevice->toString().c_str());
         str_ble_status += getTimestamp() + " - onResult " + advertisedDevice->toString().c_str() + "\n";
 
         // We have found a device, let us now see if it contains the service we are looking for.
@@ -49,7 +49,7 @@ class MyClientCallback : public BLEClientCallbacks
     {
         BLE_client_connected = false;
         str_ble_status += getTimestamp() + " - onDisconnect\n";
-        commSerial.println("onDisconnect");
+        //commSerial.println("onDisconnect");
     }
 };
 
@@ -64,7 +64,7 @@ void bleRequestData()
     {
         if (connectToServer())
         {
-            commSerial.println("We are now connected to the BLE Server.");
+            //commSerial.println("We are now connected to the BLE Server.");
             str_ble_status += getTimestamp() + " - Connected\n";
             doConnect = false;
         }
@@ -141,47 +141,47 @@ static void notifyCallback(BLERemoteCharacteristic *pBLERemoteCharacteristic, ui
 bool connectToServer()
 {
     TRACE;
-    commSerial.print("Forming a connection to ");
-    commSerial.println(myDevice->getAddress().toString().c_str());
+    //commSerial.print("Forming a connection to ");
+    //commSerial.println(myDevice->getAddress().toString().c_str());
     pClient = NimBLEDevice::createClient();
-    commSerial.println(" - Created client");
+    //commSerial.println(" - Created client");
     pClient->setClientCallbacks(new MyClientCallback());
 
     // Connect to the remote BLE Server.
     pClient->connect(myDevice); // if you pass BLEAdvertisedDevice instead of address, it will be recognized type of peer device address (public or private)
-    commSerial.println(" - Connected to server");
+    //commSerial.println(" - Connected to server");
     // Obtain a reference to the service we are after in the remote BLE server.
     //BLERemoteService*
     pRemoteService = pClient->getService(serviceUUID);
     if (pRemoteService == nullptr)
     {
-        commSerial.print("Failed to find our service UUID: ");
-        commSerial.println(serviceUUID.toString().c_str());
+        //commSerial.print("Failed to find our service UUID: ");
+        //commSerial.println(serviceUUID.toString().c_str());
         pClient->disconnect();
         return false;
     }
-    commSerial.println(" - Found our service");
+    //commSerial.println(" - Found our service");
 
     // Obtain a reference to the characteristic in the service of the remote BLE server.
     pRemoteCharacteristic = pRemoteService->getCharacteristic(charUUID_rx);
     if (pRemoteCharacteristic == nullptr)
     {
-        commSerial.print("Failed to find our characteristic UUID: ");
-        commSerial.println(charUUID_rx.toString().c_str());
+        //commSerial.print("Failed to find our characteristic UUID: ");
+        //commSerial.println(charUUID_rx.toString().c_str());
         pClient->disconnect();
         return false;
     }
-    commSerial.println(" - Found our characteristic");
+    //commSerial.println(" - Found our characteristic");
     // Read the value of the characteristic.
     if (pRemoteCharacteristic->canRead())
     {
         std::string value = pRemoteCharacteristic->readValue();
-        commSerial.print("The characteristic value was: ");
-        commSerial.println(value.c_str());
+        //commSerial.print("The characteristic value was: ");
+        //commSerial.println(value.c_str());
     }
 
     if (pRemoteCharacteristic->canNotify()) {
-		    commSerial.print("The Device can notify");
+		    //commSerial.print("The Device can notify");
         //pRemoteCharacteristic->registerForNotify(notifyCallback);
         pRemoteCharacteristic->subscribe(true, notifyCallback);
     }
@@ -203,6 +203,6 @@ void sendCommand(uint8_t *data, size_t dataLen)
     }
     else
     {
-        commSerial.println("Remote TX characteristic not found");
+        //commSerial.println("Remote TX characteristic not found");
     }
 }
