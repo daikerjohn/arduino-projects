@@ -119,17 +119,18 @@ class MyClientCallback : public NimBLEClientCallbacks
     };
 };
 
-/** Notification / Indication receiving handler callback */
 void notifyCB(NimBLERemoteCharacteristic* pRemoteChar, uint8_t* pData, size_t length, bool isNotify){
     bleCollectPacket((char *)pData, length);
+    /*
     std::string str = (isNotify == true) ? "Notification" : "Indication";
     str += " from ";
-    /** NimBLEAddress and NimBLEUUID have std::string operators */
+    // NimBLEAddress and NimBLEUUID have std::string operators
     str += std::string(pRemoteChar->getRemoteService()->getClient()->getPeerAddress());
     str += ": Service = " + std::string(pRemoteChar->getRemoteService()->getUUID());
     str += ", Characteristic = " + std::string(pRemoteChar->getUUID());
     str += ", Value = " + std::string((char*)pData, length);
     TelnetPrint.println(str.c_str());
+    */
 }
 
 void bleRequestData()
@@ -183,10 +184,6 @@ void bleRequestData()
       TelnetPrint.println("doScan");
       BLEDevice::getScan()->start(0); // this is just example to start scan after disconnect, most likely there is better way to do it in arduino
     }
-#endif
-
-#ifdef SIMULATION
-    bmsSimulate();
 #endif
 }
 
@@ -248,23 +245,12 @@ class AdvertisedDeviceCallbacks: public NimBLEAdvertisedDeviceCallbacks {
     };
 };
 
-static void notifyCallbackTwo(
-  BLERemoteCharacteristic* pBLERemoteCharacteristic,
-  uint8_t* pData,
-  size_t length,
-  bool isNotify) {
-    TelnetPrint.printf("Notify callback for characteristic %s of data length %d\n",
-           pBLERemoteCharacteristic->getUUID().toString().c_str(),
-           length);
-    hexDump((char*)pData, length);
-    bleCollectPacket((char *)pData, length);
-}
-
-static void notifyCallback(BLERemoteCharacteristic *pBLERemoteCharacteristic, uint8_t *pData, size_t length, bool isNotify) //this is called when BLE server sents data via notofication
-{
-    TRACE;
-    hexDump((char*)pData, length);
-    bleCollectPacket((char *)pData, length);
+/** Notification / Indication receiving handler callback */
+static void notifyCallbackTwo(BLERemoteCharacteristic* pBLERemoteCharacteristic, uint8_t* pData, size_t length,bool isNotify) {
+  TelnetPrint.printf("Notify callback for characteristic %s of data length %d\n",
+          pBLERemoteCharacteristic->getUUID().toString().c_str(), length);
+  //hexDump((char*)pData, length);
+  bleCollectPacket((char *)pData, length);
 }
 
 bool connectToServer()
@@ -273,35 +259,29 @@ bool connectToServer()
     //commSerial.print("Forming a connection to ");
     //commSerial.println(advDevice->getAddress().toString().c_str());
     pClientOld = NimBLEDevice::createClient();
-        TelnetPrint.println("New client created");
+    TelnetPrint.println("New client created");
 
-        
-        //pClient->setClientCallbacks(&clientCB, false);
-        //pClient->setClientCallbacks(new MyClientCallback());
-
-
-    //commSerial.println(" - Created client");
     TelnetPrint.println("setClientCallbacks");
     delay(100);
     pClientOld->setClientCallbacks(new MyClientCallback());
     //pClientOld->setClientCallbacks(new ClientCallbacks());
 
-        /** Set initial connection parameters: These settings are 15ms interval, 0 latency, 120ms timout.
-         *  These settings are safe for 3 clients to connect reliably, can go faster if you have less
-         *  connections. Timeout should be a multiple of the interval, minimum is 100ms.
-         *  Min interval: 12 * 1.25ms = 15, Max interval: 12 * 1.25ms = 15, 0 latency, 51 * 10ms = 510ms timeout
-         */
-        TelnetPrint.println("setConnectionParams");
-        pClientOld->setConnectionParams(12,12,0,51);
-        /** Set how long we are willing to wait for the connection to complete (seconds), default is 30. */
-        TelnetPrint.println("setConnectTimeout");
-        pClientOld->setConnectTimeout(5);
+    /** Set initial connection parameters: These settings are 15ms interval, 0 latency, 120ms timout.
+      *  These settings are safe for 3 clients to connect reliably, can go faster if you have less
+      *  connections. Timeout should be a multiple of the interval, minimum is 100ms.
+      *  Min interval: 12 * 1.25ms = 15, Max interval: 12 * 1.25ms = 15, 0 latency, 51 * 10ms = 510ms timeout
+      */
+    TelnetPrint.println("setConnectionParams");
+    pClientOld->setConnectionParams(12,12,0,51);
+    /** Set how long we are willing to wait for the connection to complete (seconds), default is 30. */
+    TelnetPrint.println("setConnectTimeout");
+    pClientOld->setConnectTimeout(5);
 
-        TelnetPrint.println("Checking some things...");
-        if(myDevice == nullptr) {
-          TelnetPrint.println("myDevice == nullptr");
-          return false;
-        }
+    TelnetPrint.println("Checking some things...");
+    if(myDevice == nullptr) {
+      TelnetPrint.println("myDevice == nullptr");
+      return false;
+    }
     // Connect to the remote BLE Server.
     if(pClientOld->isConnected()) {
       TelnetPrint.println("pClientOld->isConnected()");
@@ -312,21 +292,16 @@ bool connectToServer()
         return false;
       }
     }
-    //commSerial.println(" - Connected to server");
+
     // Obtain a reference to the service we are after in the remote BLE server.
-    //BLERemoteService*
-    //pRemoteService = pClientOld->getService(serviceUUID);
     TelnetPrint.println("pClientOld->getService");
     pRemoteService = pClientOld->getService(serviceUUID);
     if (pRemoteService == nullptr)
     {
-        //commSerial.print("Failed to find our service UUID: ");
-        //commSerial.println(serviceUUID.toString().c_str());
         TelnetPrint.println("pClientOld->disconnect");
         pClientOld->disconnect();
         return false;
     }
-    //commSerial.println(" - Found our service");
 
     // Obtain a reference to the characteristic in the service of the remote BLE server.
     pRemoteCharacteristic = pRemoteService->getCharacteristic(charUUID_rx);
@@ -334,24 +309,17 @@ bool connectToServer()
     {
         TelnetPrint.print("Failed to find our characteristic UUID: ");
         TelnetPrint.println(charUUID_rx.toString().c_str());
-        //commSerial.print("Failed to find our characteristic UUID: ");
-        //commSerial.println(charUUID_rx.toString().c_str());
         pClientOld->disconnect();
         return false;
     }
-    //commSerial.println(" - Found our characteristic");
+
     // Read the value of the characteristic.
     if (pRemoteCharacteristic->canRead())
     {
         std::string value = pRemoteCharacteristic->readValue();
-        //commSerial.print("The characteristic value was: ");
-        //commSerial.println(value.c_str());
     }
 
     if (pRemoteCharacteristic->canNotify()) {
-		    //commSerial.print("The Device can notify");
-        //pRemoteCharacteristic->registerForNotify(notifyCallback);
-        //pRemoteCharacteristic->subscribe(true, notifyCallback);
         pRemoteCharacteristic->subscribe(true, notifyCallbackTwo);
     } else {
       TelnetPrint.println("Cannot subscribe to rx characteristic");
@@ -363,53 +331,23 @@ bool connectToServer()
 
 void sendCommand(uint8_t *data, size_t dataLen)
 {
-    TRACE;
-    //https://github.com/FurTrader/OverkillSolarBMS/blob/master/Comm_Protocol_Documentation/BLE%20_bluetooth_protocol.md#executive-summary
-    //pRemoteService->getCharacteristics(true);
-    //TelnetPrint.print("Characteristics: ");
-    //TelnetPrint.println(pRemoteService->toString().c_str());
-    BLERemoteCharacteristic *pRemoteCharacteristic_overkill;
+  TRACE;
+  //https://github.com/FurTrader/OverkillSolarBMS/blob/master/Comm_Protocol_Documentation/BLE%20_bluetooth_protocol.md#executive-summary
+  //TelnetPrint.print("Characteristics: ");
+  //TelnetPrint.println(pRemoteService->toString().c_str());
+  BLERemoteCharacteristic *pRemoteCharacteristic_overkill;
 
-    pRemoteCharacteristic_overkill = pRemoteService->getCharacteristic(charUUID_tx);
-    if (pRemoteCharacteristic_overkill)
-    {
-        //flush();
-        TelnetPrint.println(getTimestamp() + " Write to Regular");
-        if(!pRemoteCharacteristic_overkill->writeValue(data, dataLen, false)) {
-          TelnetPrint.println("Unable to send command");
-        }
-        //sleep(100);
-        //commSerial.println("bms request sent");
-        //str_ble_status += "bms request send\n";
-        //TelnetPrint.println("bms request send");
+  pRemoteCharacteristic_overkill = pRemoteService->getCharacteristic(charUUID_tx);
+  if (pRemoteCharacteristic_overkill)
+  {
+    TelnetPrint.println(getTimestamp() + " Write to Regular");
+    if(!pRemoteCharacteristic_overkill->writeValue(data, dataLen, false)) {
+      TelnetPrint.println("Unable to send command");
     }
-    else
-    {
-        str_ble_status += "Remote TX characteristic not found\n";
-        TelnetPrint.println("Remote TX characteristic not found");
-        //commSerial.println("Remote TX characteristic not found");
-    }
-    /*
-    BLERemoteCharacteristic *pRemoteCharacteristic_overkill;
-    pRemoteCharacteristic_overkill = pRemoteService->getCharacteristic(charUUID_tx);
-    if (pRemoteCharacteristic_overkill)
-    {
-        TelnetPrint.println("Write to Overkill: canWrite: " + String(pRemoteCharacteristic_overkill->canWrite()));
-        TelnetPrint.println("Write to Overkill: canWriteNoResponse: " + String(pRemoteCharacteristic_overkill->canWriteNoResponse()));
-        //flush();
-        TelnetPrint.println("Write to Overkill");
-        if(!pRemoteCharacteristic_overkill->writeValue(data, dataLen, false)) {
-          TelnetPrint.println("Unable to send command");
-        }
-        //commSerial.println("bms request sent");
-        //str_ble_status += "bms request send\n";
-        //TelnetPrint.println("bms request send");
-    }
-    else
-    {
-        str_ble_status += "Remote TX characteristic not found\n";
-        TelnetPrint.println("Remote TX characteristic not found");
-        //commSerial.println("Remote TX characteristic not found");
-    }
-    */
+  }
+  else
+  {
+    str_ble_status += "Remote TX characteristic not found\n";
+    TelnetPrint.println("Remote TX characteristic not found");
+  }
 }

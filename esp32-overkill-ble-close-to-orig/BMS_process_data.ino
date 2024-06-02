@@ -45,35 +45,43 @@ bool isPacketValid(byte *packet) //check if packet is valid
 
 bool processBasicInfo(packBasicInfoStruct *output, byte *data, unsigned int dataLen)
 {
-  //str_ble_status += "dataLen " + String(dataLen) + "\n";
-    TelnetPrint.printf("dataLen: 0x%x\n", dataLen);
-    TRACE;
-    // Expected data len
-    if (dataLen != 0x1D && dataLen != 0x1B)
-    {
-      return false;
-    }
-    TelnetPrint.println("processing basic!");
+  // https://github.com/FurTrader/OverkillSolarBMS/blob/master/Comm_Protocol_Documentation/JBD_REGISTER_MAP.md
+  TelnetPrint.printf("dataLen: 0x%x\n", dataLen);
+  TRACE;
+  // Expected data len
+  if (dataLen != 0x1D && dataLen != 0x1B)
+  {
+    return false;
+  }
+  TelnetPrint.println("processing basic!");
 
-    output->Volts = ((uint32_t)two_ints_into16(data[0], data[1])) * 10; // Resolution 10 mV -> convert to milivolts   eg 4895 > 48950mV
-    output->Amps = ((int32_t)two_ints_into16(data[2], data[3])) * 10;   // Resolution 10 mA -> convert to miliamps
+  output->Volts = ((uint32_t)two_ints_into16(data[0], data[1])) * 10; // Resolution 10 mV -> convert to milivolts   eg 4895 > 48950mV
+  output->Amps = ((int32_t)two_ints_into16(data[2], data[3])) * 10;   // Resolution 10 mA -> convert to miliamps
 
-    output->Watts = output->Volts * output->Amps / 1000000; // W
+  output->Watts = output->Volts * output->Amps / 1000000; // W
 
-    output->CapacityAh = ((uint32_t)two_ints_into16(data[6], data[7])) * 10;
-    output->CapacityRemainAh = ((uint32_t)two_ints_into16(data[4], data[5])) * 10;
-    output->CapacityRemainPercent = ((uint16_t)data[19]);
-    output->Cycles = ((uint8_t)two_ints_into16(data[8], data[9]));
+  output->CapacityAh = ((uint32_t)two_ints_into16(data[6], data[7])) * 10;
+  output->CapacityRemainAh = ((uint32_t)two_ints_into16(data[4], data[5])) * 10;
+  output->CapacityRemainPercent = ((uint16_t)data[19]);
+  output->Cycles = ((uint8_t)two_ints_into16(data[8], data[9]));
 
-    output->CapacityRemainWh = (output->CapacityRemainAh * c_cellNominalVoltage) / 1000000 * packCellInfo.NumOfCells;
+  //output->ManufactureDate = ((uint16_t)two_ints_into16(data[10], data[11]));  //bits 15:9=year - 2000    bits 8:5=month    bits 4:0=Day
 
-    output->Temp1 = (((uint16_t)two_ints_into16(data[23], data[24])) - 2731);
-    output->Temp2 = (((uint16_t)two_ints_into16(data[25], data[26])) - 2731);
-    output->BalanceCodeLow = (two_ints_into16(data[12], data[13]));
-    output->BalanceCodeHigh = (two_ints_into16(data[14], data[15]));
-    output->MosfetStatus = ((byte)data[20]);
+  //output->CurrentErrors = ((uint16_t)two_ints_into16(data[16], data[17]));  // CurrentErrors
 
-    return true;
+  //output->SoftwareVersion = ((byte)data[18]);  // Software Version
+  //output->CellCount = ((byte)data[21]);  // Number of Cells
+  //output->NtcCount = ((byte)data[22]);  // Number of NTC
+
+  output->CapacityRemainWh = (output->CapacityRemainAh * c_cellNominalVoltage) / 1000000 * packCellInfo.NumOfCells;
+
+  output->Temp1 = (((uint16_t)two_ints_into16(data[23], data[24])) - 2731);
+  output->Temp2 = (((uint16_t)two_ints_into16(data[25], data[26])) - 2731);
+  output->BalanceCodeLow = (two_ints_into16(data[12], data[13]));
+  output->BalanceCodeHigh = (two_ints_into16(data[14], data[15]));
+  output->MosfetStatus = ((byte)data[20]);
+
+  return true;
 };
 
 bool processCellInfo(packCellInfoStruct *output, byte *data, unsigned int dataLen)
@@ -198,13 +206,13 @@ bool bmsProcessPacket(byte *packet)
 
 bool bleCollectPacket(char *data, uint32_t dataSize) // reconstruct packet from BLE incomming data, called by notifyCallback function
 {
-    last_data_capture = getTimestamp();
+    last_data_capture_bms = getTimestamp();
     TRACE;
     static uint8_t packetstate = 0; //0 - empty, 1 - first half of packet received, 2- second half of packet received
     static uint8_t packetbuff[40] = {0x0};
     static uint32_t previousDataSize = 0;
     bool retVal = false;
-    hexDump(data,dataSize);
+    //hexDump(data,dataSize);
 
     if (data[0] == 0xdd && packetstate == 0) // probably got 1st half of packet
     {
@@ -320,6 +328,11 @@ int16_t two_ints_into16(int highbyte, int lowbyte) // turns two bytes into a sin
     return result;
 }
 
+/*
+
+#define STRINGBUFFERSIZE 300
+char stringBuffer[STRINGBUFFERSIZE];
+
 void constructBigString(bool asPlaintext) //debug all data to uart
 {
   char endline[5] = "<br>";
@@ -352,3 +365,4 @@ void constructBigString(bool asPlaintext) //debug all data to uart
     snprintf(stringBuffer, STRINGBUFFERSIZE, "Median cell volt: %f\n", (float)packCellInfo.CellMedian / 1000);
     snprintf(stringBuffer, STRINGBUFFERSIZE, "\n");
 }
+*/

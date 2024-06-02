@@ -31,6 +31,8 @@ typedef struct
 	uint16_t BalanceCodeLow;
 	uint16_t BalanceCodeHigh;
 	uint8_t MosfetStatus;
+	uint16_t CurrentErrors;
+	uint8_t SoftwareVersion;
 	
 } packBasicInfoStruct;
 
@@ -60,9 +62,6 @@ struct packEepromStruct
 	uint16_t CHGOC;
 	uint16_t DSGOC;
 };
-
-#define STRINGBUFFERSIZE 300
-char stringBuffer[STRINGBUFFERSIZE];
 
 const int32_t c_cellNominalVoltage = 3700; //mV
 

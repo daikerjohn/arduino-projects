@@ -53,6 +53,7 @@ EpeverTracer tracer;
     Charging equipment status    3201
     Discharging equipment status 3202
 */
+/*
 #define PANEL_VOLTS      0x00
 #define PANEL_AMPS       0x01
 #define PANEL_POWER_L    0x02
@@ -105,6 +106,7 @@ const char *realtimeMetricNames[] = {"PV_array_voltage",
                        "Load_power",
                        "Battery_temperature",
                        "Internal_temperature"};
+*/
 
 /*
 "Statistical parameter registers
@@ -134,12 +136,9 @@ const char *realtimeMetricNames[] = {"PV_array_voltage",
 #include "mydatatypes.h"
 //#include <Wire.h>
 
-//HardwareSerial commSerial(0);
-
 static NimBLEClient *pClientOld;
 
 //---- global variables ----
-
 static boolean doConnect = false;
 static boolean BLE_client_connected = false;
 static boolean doScan = false;
@@ -157,6 +156,7 @@ const long interval = 5000;
 bool toggle = false;
 bool newPacketReceived = false;
 
+bool last_action_was_manual = false;
 
 
 #include <queue>
@@ -170,7 +170,7 @@ bool newPacketReceived = false;
 
 //#include <AsyncTCP.h>
 #include <ESPAsyncWebSrv.h>
-#include <ArduinoJson.h>
+//#include <ArduinoJson.h>
 
 #ifdef ESP8266
 #include <Updater.h>
@@ -213,7 +213,8 @@ char stat_char[STATUS_BUFFER_SIZE] = "";
 float latest_hashrate = 0.0;
 String str_ble_status = "";
 String str_http_status = "";
-String last_data_capture = "";
+String last_data_capture_bms = "";
+String last_data_capture_scc = "";
 
 //For UTC -8.00 : -8 * 60 * 60 : -28800
 const long gmtOffset_sec = -28800;
@@ -235,7 +236,7 @@ bool ble_autoconn = false;
 //Your Domain name with URL path or IP address with path
 //const char *serverName = "https://lhbqdvca46.execute-api.us-west-2.amazonaws.com/dev/solar";
 //String serverName = "https://us-west-2.aws.data.mongodb-api.com/app/solar-0-cvgqn/endpoint/createSolar";
-String serverName = "http://192.168.10.61:3000/dev/solar";
+const String serverName = "http://192.168.10.61:3000/dev/solar";
 
 
 unsigned long currentMillis = 0;
@@ -259,7 +260,11 @@ unsigned long timerWebDelayMS = 60000;
 const int num_data_points_sma = 10;
 const int num_data_points_decision = 8;
 
-#define RELAY_PIN 21
+// ESP32 - GPIO PIN 
+#define RELAY_PIN_ONE 21
+#define RELAY_PIN_TWO 22
+// Arduino Nano ESP32
+//#define RELAY_PIN 8
 
 /*
 A note about which pins to use: 
@@ -267,8 +272,8 @@ A note about which pins to use:
 which worked on an ESP32 Wroom but not an ESP32 Rover. So I switched to pins 13 and 14, which works on both.
 I haven't tested on an Arduino board though.
 */
-#define RXD2 13
-#define TXD2 14
+//#define RXD2 13
+//#define TXD2 14
 
 /*
 Number of registers to check. I think all Renogy controllers have 35
@@ -393,9 +398,6 @@ public:
   }
 };
 
-// if you don't have a charge controller to test with, can set this to true to get non 0 voltage readings
-bool simulator_mode = false;
-
 int batt_cap_ah = 280;
 //float max_battery_discharge = .2;
 
@@ -411,16 +413,8 @@ long shut_cool_ms = 600000;
 // Prevent any automatic power-on for 120 seconds
 long next_available_startup = millis() + 120000;
 
-
-float sim_starting_battery_voltage = 13.12;
-float sim_bat_volt_change = -0.11;
-
-uint8_t sim_starting_battery_soc = 51.5;
-float sim_bat_soc_change = -1;
-
 bool load_running = false;
 
-float sim_starting_solar_panel_watts = 20;
 bool first_loop = true;
 
 
@@ -450,7 +444,8 @@ void setup() {
   Serial.begin(115200);
   Serial.println("Started!");
 
-  pinMode(RELAY_PIN, OUTPUT);
+  pinMode(RELAY_PIN_ONE, OUTPUT);
+  pinMode(RELAY_PIN_TWO, OUTPUT);
 
   //renogy_control_load(0);
   turn_off_load("Load Off - Startup");
@@ -470,6 +465,8 @@ void setup() {
   //bool default_set = false;
   ssid_str = prefs.getString("ssid", "dirker");
   password_str = prefs.getString("password", "alphabit");
+  //ssid_str = "dirker";
+  //password_str = "alphabit";
 
   allow_auto = prefs.getBool("allow_auto", false);
   // Initial setup if key does not exist
@@ -526,6 +523,7 @@ void setup() {
   //configTime(0, 0, "pool.ntp.org");
 
   AsyncElegantOTA.begin(&server);  // Start AsyncElegantOTA
+  Serial.println("After AsyncElegantOTA.begin()");
 
   handle_webserver_connection();
 
@@ -540,10 +538,13 @@ void setup() {
   if (ble_autoconn) {
     bleStartup();
   }
+  Serial.println("After bleStartup");
 
   tracer.begin();
+  Serial.println("After tracer.begin()");
 
   boot_time_str = getTimestamp();
+  Serial.println("After getTimestamp()");
 }
 
 String structToString() {
@@ -555,7 +556,18 @@ String structToString() {
     asdf += "\"battery_temperature\": " + String((float)packBasicInfo.Temp1 / 10) + ",";
     asdf += "\"battery_watts_net\": " + String((float)packBasicInfo.Watts) + ",";
     asdf += "\"controller_temperature\": " + String((float)packBasicInfo.Temp2 / 10) + ",";
+      TracerData *data = tracer.getData();
+      if (data->everythingRead) {
+        asdf += "\"solar_panel_voltage\": " + String(data->realtimeData.pvVoltage) + ",";
+        asdf += "\"solar_panel_amps\": " + String(data->realtimeData.pvCurrent) + ",";
+        asdf += "\"solar_panel_watts\": " + String(data->realtimeData.pvPower) + ",";
 
+        asdf += "\"solar_charging_voltage\": " + String(data->realtimeData.batteryVoltage) + ",";
+        asdf += "\"solar_charging_amps\": " + String(data->realtimeData.batteryChargingCurrent) + ",";
+        asdf += "\"solar_charging_watts\": " + String(data->realtimeData.batteryChargingPower) + ",";
+      }
+
+/*
     if (tracer.update()) {
       TracerData *data = tracer.getData();
       if (data->everythingRead) {
@@ -585,6 +597,7 @@ String structToString() {
         TelnetPrint.println("MODBUS missing something...");
       }
     }
+    */
 
 
 /*
@@ -636,16 +649,7 @@ String structToString() {
 String automatic_decision = "";
 String current_status = "";
 
-const char *headHtml = R"literal(
-<!DOCTYPE html><html>
-<head><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
-<link rel=\"icon\" href=\"data:,\">
-<style>html { font-family: Helvetica; display: inline-block; margin: 0px auto; text-align: center;}
-.button { background-color: #4CAF50; border: none; color: white; padding: 16px 40px;
-text-decoration: none; font-size: 30px; margin: 2px; cursor: pointer;}
-.button2 {background-color: #555555;}</style>
-<script>
-)literal";
+
 
 String htmlHead(bool includeReload = true) {
   // Display the HTML web page
@@ -662,6 +666,17 @@ String htmlHead(bool includeReload = true) {
 
   data += "<script>";
   */
+
+const char *headHtml = R"literal(
+<!DOCTYPE html><html>
+<head><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
+<link rel=\"icon\" href=\"data:,\">
+<style>html { font-family: Helvetica; display: inline-block; margin: 0px auto; text-align: center;}
+.button { background-color: #4CAF50; border: none; color: white; padding: 16px 40px;
+text-decoration: none; font-size: 30px; margin: 2px; cursor: pointer;}
+.button2 {background-color: #555555;}</style>
+<script>
+)literal";
 
   String data = String(headHtml);
   if (includeReload) {
@@ -706,7 +721,8 @@ String statsIndex() {
   data += "<p>Automatics: " + String(allow_auto ? "On" : "Off") + "</p>";
   data += automatic_decisions.html();
 
-  data += "<p>Last Data Capture: " + last_data_capture + "</p>";
+  data += "<p>Last BMS Data Capture: " + last_data_capture_bms + "</p>";
+  data += "<p>Last SCC Data Capture: " + last_data_capture_scc + "</p>";
   if (current_status != "") {
     data += "<p>Current: " + String(current_status) + "</p>";
   }
@@ -753,12 +769,15 @@ String configIndex() {
   data += "<form action=\"/set\">BLE Auto Connect: <input type=\"text\" name=\"ble_autoconn\" value=\"" + String(ble_autoconn) + "\"><br/>";
   data += "<input type=\"submit\" value=\"Submit\"></form>";
 
+  //data += "<form action=\"/set\">BLE Auto Connect: <input type=\"text\" name=\"ble_autoconn\" value=\"" + String(ble_autoconn) + "\"><br/>";
+  //data += "<input type=\"submit\" value=\"Submit\"></form>";
+
   data += htmlFoot();
   return data;
 }
 
 String rawIndex(bool asPlaintext = true) {
-  const int BUFFERSIZE = 500;
+  const int BUFFERSIZE = 750;
   char sBuff[BUFFERSIZE] = "";
   char endline[5] = "<br>";
   if(asPlaintext) {
@@ -768,7 +787,10 @@ String rawIndex(bool asPlaintext = true) {
   sBuff[0] = '\0'; //clear old data
   //sprintf(sBuff, "Total voltage: %f %s", (float)packBasicInfo.Volts / 1000, endline);
   //sprintf(sBuff, "Amps: %f %s", (float)packBasicInfo.Amps / 1000, endline);
-  snprintf(sBuff + strlen(sBuff), BUFFERSIZE - strlen(sBuff), "Captured: %s", last_data_capture.c_str());
+  snprintf(sBuff + strlen(sBuff), BUFFERSIZE - strlen(sBuff), "BMS Captured: %s", last_data_capture_bms.c_str());
+  snprintf(sBuff + strlen(sBuff), BUFFERSIZE - strlen(sBuff), "%s", endline);
+
+  snprintf(sBuff + strlen(sBuff), BUFFERSIZE - strlen(sBuff), "SCC Captured: %s", last_data_capture_scc.c_str());
   snprintf(sBuff + strlen(sBuff), BUFFERSIZE - strlen(sBuff), "%s", endline);
 
   snprintf(sBuff + strlen(sBuff), BUFFERSIZE - strlen(sBuff), "Total voltage: %.2f", (float)packBasicInfo.Volts / 1000);
@@ -807,7 +829,6 @@ String rawIndex(bool asPlaintext = true) {
   {
       snprintf(sBuff + strlen(sBuff), BUFFERSIZE - strlen(sBuff), "Cell no. %u    %.3f", i, (float)packCellInfo.CellVolt[i - 1] / 1000);
       snprintf(sBuff + strlen(sBuff), BUFFERSIZE - strlen(sBuff), "%s", endline);
-      //snprintf(sBuff, STRINGBUFFERSIZE, "   %f\n", (float)packCellInfo.CellVolt[i - 1] / 1000);
   }
   snprintf(sBuff + strlen(sBuff), BUFFERSIZE - strlen(sBuff), "Max cell volt: %.3f", (float)packCellInfo.CellMax / 1000);
   snprintf(sBuff + strlen(sBuff), BUFFERSIZE - strlen(sBuff), "%s", endline);
@@ -851,7 +872,8 @@ void turn_off_load(String decision) {
     automatic_decisions.push(automatic_decision);
     AppendStatus(automatic_decision);
   }
-  renogy_control_load(0);
+  renogy_control_load(0, RELAY_PIN_ONE);
+  renogy_control_load(0, RELAY_PIN_TWO);
 }
 
 void power_on_load(String decision) {
@@ -860,36 +882,32 @@ void power_on_load(String decision) {
     automatic_decisions.push(automatic_decision);
     AppendStatus(automatic_decision);
   }
-  renogy_control_load(1);
+  renogy_control_load(1, RELAY_PIN_ONE);
+  renogy_control_load(1, RELAY_PIN_TWO);
 }
 
 void handle_webserver_connection() {
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
-    //harvest_data();
     status_str = "";
     stat_char[0] = '\0';
     update_decisions(false);
     request->send(200, "text/html", statsIndex());
   });
   server.on("/ble", HTTP_GET, [](AsyncWebServerRequest *request) {
-    //harvest_data();
     //update_decisions(false);
     request->send(200, "text/plain", str_ble_status);
   });
   server.on("/http", HTTP_GET, [](AsyncWebServerRequest *request) {
-    //harvest_data();
     //update_decisions(false);
     request->send(200, "text/html", str_http_status);
   });
   server.on("/raw", HTTP_GET, [](AsyncWebServerRequest *request) {
-    //harvest_data();
     status_str = "";
     stat_char[0] = '\0';
     update_decisions(false);
     request->send(200, "text/plain", rawIndex(true));
   });
   server.on("/json", HTTP_GET, [](AsyncWebServerRequest *request) {
-    //harvest_data();
     status_str = "";
     stat_char[0] = '\0';
     update_decisions(false);
@@ -915,10 +933,12 @@ void handle_webserver_connection() {
   // Load control
   server.on("/load/on", HTTP_GET, [](AsyncWebServerRequest *request) {
     power_on_load("Load On - Manual");
+    last_action_was_manual = true;
     request->redirect("/");
   });
   server.on("/load/off", HTTP_GET, [](AsyncWebServerRequest *request) {
     turn_off_load("Load Off - Manual");
+    last_action_was_manual = true;
     request->redirect("/");
   });
 
@@ -952,7 +972,7 @@ void handle_webserver_connection() {
     //doScan = false;
 
     str_ble_status += getTimestamp() + " - BLE - Disconnect\n";
-    last_data_capture = "Disconnected";
+    last_data_capture_bms = "Disconnected";
     //turn_off_load("Load Off - Manual");
     request->redirect("/");
   });
@@ -1054,31 +1074,10 @@ String getTimestamp() {
   //return now;
 }
 
-void harvest_data() {
-  /*
-  static uint32_t i;
-  i++;
-
-  // set word 0 of TX buffer to least-significant word of counter (bits 15..0)
-  node.setTransmitBuffer(0, lowWord(i));  
-  // set word 1 of TX buffer to most-significant word of counter (bits 31..16)
-  node.setTransmitBuffer(1, highWord(i));
-
-  renogy_read_data_registers();
-  if(BLE_client_connected && renogy_data.battery_voltage >= 256) {
-    // Likely bad data. Delay and try again
-    delay(10);
-    renogy_read_data_registers();
-  }
-
-  //renogy_read_info_registers();
-  */
-}
-
 void update_decisions(bool allow_automatic) {
   AppendStatus("Current Time: " + getTimestamp());
-  if (!BLE_client_connected && !simulator_mode) {
-    AppendStatus("Controller is not connected. No decisions will be made");
+  if (!BLE_client_connected) {
+    AppendStatus("BLE Controller is not connected. No decisions will be made");
     return;
   }
 
@@ -1093,6 +1092,17 @@ void update_decisions(bool allow_automatic) {
 
   int valid_data_points_net_amps = 0;
   net_avg_system_amps = net_system_amps_queue.average(&valid_data_points_net_amps, "Avg Net System Amps");
+
+  // The new M4-ATX module seems to continue running even beyond an OTA update (and subsequent relay flapping on reboot)
+  // So it's possible the load is actually still running after a reboot!?!?  This handles that case.
+  // last_action_was_manual == true means we turned it *on* or *off* manually.
+  // If something happened automatically then there's not need to override the 'load_running' variable.
+  if (valid_data_points_load_watts > (num_data_points_decision/2)) {
+    //if (net_avg_system_watts < 0.0 && !last_action_was_manual) {  
+    if (net_avg_system_watts < 0.0) {  
+      load_running = true;
+    }
+  }
 
   //float net_rate_ah = (float)packBasicInfo.Amps / 1000;
   //float time_to_empty_hrs = (((avg_batt_soc / 100.00) - (1 - max_battery_discharge)) * batt_cap_ah) / (net_rate_ah * -1.0);
@@ -1116,17 +1126,15 @@ void update_decisions(bool allow_automatic) {
   if (valid_data_points_battery_voltage > num_data_points_decision && valid_data_points_battery_soc > num_data_points_decision) {
     if (load_running && avg_batt_volts < batt_volt_min) {
       if (allow_automatic) {
+        last_action_was_manual = false;
         turn_off_load("Turn load off (voltage) " + String(avg_batt_volts) + " < " + String(batt_volt_min));
       }
-      sim_bat_volt_change = fabs(sim_bat_volt_change) * 1.0;
-      sim_bat_soc_change = fabs(sim_bat_soc_change);
     } else {
       if (load_running && avg_batt_soc < batt_soc_min) {
         if (allow_automatic) {
+          last_action_was_manual = false;
           turn_off_load("Turn load off (battery soc) " + String(avg_batt_soc) + " < " + String(batt_soc_min));
         }
-        sim_bat_volt_change = fabs(sim_bat_volt_change) * 1.0;
-        sim_bat_soc_change = fabs(sim_bat_soc_change);
       } else {
         if (load_running) {
           current_status = "";
@@ -1136,6 +1144,7 @@ void update_decisions(bool allow_automatic) {
             if (avg_batt_soc > batt_soc_start) {
               if (next_available_startup != 0 && millis() > next_available_startup) {
                 if (allow_automatic && net_avg_system_amps > 0) {
+                  last_action_was_manual = false;
                   power_on_load("Turn on load");
                 }
                 current_status = "";
@@ -1143,12 +1152,6 @@ void update_decisions(bool allow_automatic) {
                 AppendStatus("Wait for cooldown: " + String(next_available_startup - millis()));
                 current_status = "Wait for cooldown " + String(next_available_startup - millis());
               }
-
-              //if(simulator_mode) {
-              //  renogy_data.load_watts = 8;
-              //}
-              sim_bat_volt_change = fabs(sim_bat_volt_change) * -1.0;
-              sim_bat_soc_change = -fabs(sim_bat_soc_change);
             } else {
               AppendStatus("SOC too low to start");
             }
@@ -1267,18 +1270,17 @@ void loop() {
       TelnetPrint.println("bleRequestData");
       bleRequestData();
     }
-    //sleep(100);
     
-    requestFromEPEver();
-    sendRequestToAstro();
+    if(requestFromEPEver()) {
+      last_data_capture_scc = getTimestamp();
+    }
+    if(!sendRequestToAstro()) {
+      sendRequestToLuna();
+    }
 
-    //if(allow_automatic) {
-    //battery_voltage_queue.push(renogy_data.battery_voltage);
     if((float)packBasicInfo.CapacityRemainPercent > 0.0) {
       battery_voltage_queue.push((float)packBasicInfo.Volts / 1000);
-      //battery_soc_queue.push(renogy_data.battery_soc);
       battery_soc_queue.push((float)packBasicInfo.CapacityRemainPercent);
-      //net_system_watts_queue.push((float)renogy_data.load_watts);
       net_system_watts_queue.push((float)packBasicInfo.Watts);
       net_system_amps_queue.push((float)packBasicInfo.Amps / 1000);
     }
@@ -1295,26 +1297,6 @@ void loop() {
       float time_to_empty_mins = time_to_empty_hrs * 60;
       time_to_empty_queue.push(time_to_empty_mins);
     }
-    //}
-
-    /*
-    if(simulator_mode) {
-      renogy_data.battery_voltage += (sim_bat_volt_change*1.0);
-      if(renogy_data.battery_voltage > 13.7) {
-        renogy_data.battery_voltage = 13.7;
-      }
-      //if(sim_bat_soc_change > 0) {
-        //TelnetPrint.println("sim_bat_soc_change: " + String(sim_bat_soc_change));
-      //}
-      renogy_data.battery_soc += sim_bat_soc_change;
-      if(renogy_data.battery_soc > 100) {
-        renogy_data.battery_soc = 100;
-      }
-      if(load_running) {
-        renogy_data.load_watts = 8;
-      }
-    }
-    */
 
     update_decisions(allow_auto);
     lastTime = millis();
@@ -1353,7 +1335,7 @@ void loop() {
         int httpResponseCode = theHttpClient.POST(httpRequestData);
         //int httpResponseCode = 200;
 
-        TelnetPrint.print("HTTP Response code: ");
+        TelnetPrint.printf("HTTP Response code: %d\n", httpResponseCode);
         AppendStatus("Latest Posting Reponse Code: " + String(httpResponseCode));
         str_http_status += "Latest Posting Reponse Code: " + String(httpResponseCode);
 
@@ -1381,6 +1363,7 @@ void loop() {
   */
   // I think this just has to run all the time?
   tracer.update();
+
   getMeasuredUsage();
 }
 
@@ -1408,10 +1391,6 @@ void renogy_read_data_registers()
       if (print_data) TelnetPrint.println(data_registers[j]);
     }
 
-    if(!simulator_mode) {
-      renogy_data.battery_soc = data_registers[0]; 
-      renogy_data.battery_voltage = data_registers[1] * .1; // will it crash if data_registers[1] doesn't exist?
-    }
     renogy_data.battery_charging_amps = data_registers[2] * .1;
 
     renogy_data.battery_charging_watts = renogy_data.battery_voltage * renogy_data.battery_charging_amps;
@@ -1429,9 +1408,7 @@ void renogy_read_data_registers()
     renogy_data.load_watts = data_registers[6];
     renogy_data.solar_panel_voltage = data_registers[7] * .1;
     renogy_data.solar_panel_amps = data_registers[8] * .01;
-    if(!simulator_mode) {
-      renogy_data.solar_panel_watts = data_registers[9];
-    }
+
      //Register 0x10A - Turn on load, write register, unsupported in wanderer - 10
     renogy_data.min_battery_voltage_today = data_registers[11] * .1;
     renogy_data.max_battery_voltage_today = data_registers[12] * .1; 
@@ -1481,17 +1458,10 @@ void renogy_read_data_registers()
     renogy_data.solar_panel_amps = 0;
     //renogy_data.solar_panel_watts = 0;
     renogy_data.battery_charging_watts = 0;
-    if (simulator_mode) {
-      if(first_loop) {
-        renogy_data.battery_voltage = sim_starting_battery_voltage;    
-        renogy_data.battery_soc = sim_starting_battery_soc; 
-        renogy_data.solar_panel_watts = sim_starting_solar_panel_watts;
-      }
-    } else {
-      renogy_data.battery_voltage = 0;
-      renogy_data.battery_soc = 0;
-      renogy_data.solar_panel_watts = 0;
-    }
+
+    renogy_data.battery_voltage = 0;
+    renogy_data.battery_soc = 0;
+    renogy_data.solar_panel_watts = 0;
   }
 }
 */
@@ -1596,15 +1566,15 @@ void renogy_read_info_registers()
 
 
 // control the load pins on Renogy charge controllers that have them
-void renogy_control_load(bool state) {
+void renogy_control_load(bool state, int pin) {
   
   // The relays I use are wired backwards!?  So this HIGH/LOW are switched from what they'd normally be...
   // Moderately annoying.
   if (state) {
-    digitalWrite(RELAY_PIN, LOW);  // turn on load
+    digitalWrite(pin, LOW);  // turn on load
     load_running = true;
   } else {
-    digitalWrite(RELAY_PIN, HIGH);  // turn off load
+    digitalWrite(pin, HIGH);  // turn off load
     load_running = false;
   }
   next_available_startup = millis() + shut_cool_ms;
@@ -1612,7 +1582,9 @@ void renogy_control_load(bool state) {
   //else node.writeSingleRegister(0x010A, 0);  // turn off load
 }
 
-void sendRequestToAstro() {
+bool sendRequestToAstro() {
+  TelnetPrint.println("Requesting Astro");
+  bool toRet = false;
   WiFiClient localClient;
   // Astrominer API
   const uint port = 60666;
@@ -1624,7 +1596,7 @@ void sendRequestToAstro() {
       // send data.  The println is important here!
       localClient.println('A');
       //TelnetPrint.println("[Tx] A");
-      delay(500);
+      delay(100);
     }
 
     // check if response is waiting for us
@@ -1634,16 +1606,19 @@ void sendRequestToAstro() {
       //TelnetPrint.println(str);
       str_http_status += str;
 
+      /*
       String json = "{" + str + "}";
       StaticJsonDocument<200> doc;
       // Deserialize the JSON document
+      // TODO: Do this without using Arduino JSON
       DeserializationError error = deserializeJson(doc, json);
 
       // Test if parsing succeeds.
       if (error) {
         TelnetPrint.print(F("deserializeJson() failed: "));
         TelnetPrint.println(error.f_str());
-        return;
+        //localClient.close();
+        return toRet;
       } else {
         String thing = doc["hs"];
         //TelnetPrint.println(thing);
@@ -1651,15 +1626,85 @@ void sendRequestToAstro() {
         thing.replace("]", "");
         //TelnetPrint.println(thing);
         latest_hashrate = thing.toFloat();
-        //TelnetPrint.println(latest_hashrate);
+        toRet = true;
+        TelnetPrint.print("Latest hashrate json: ");
+        TelnetPrint.println(latest_hashrate);
+      }
+      */
+      if(str != "") {
+        // "algo":"astrobwt","ar":"[119,0]","fan":"[0]","hs":"[1.142244]","hs_units":"khs","uptime":273,"ver":"1.9.2.R4"
+        str.replace("hs", "X");
+        // "algo":"astrobwt","ar":"[119,0]","fan":"[0]","X":"[1.142244]","hs_units":"khs","uptime":273,"ver":"1.9.2.R4"
+        String token = str.substring(str.indexOf('X')+4, str.indexOf('X')+4+8); // token is "scott"
+        // X":"[1.142244]","hs_units":"khs","uptime":273,"ver":"1.9.2.R4"
+        token.replace("[", "");
+        token.replace("]", "");
+        token.replace("\"", "");
+        latest_hashrate = token.toFloat();
+        toRet = true;
+        TelnetPrint.print("Latest hashrate str: ");
+        TelnetPrint.println(latest_hashrate);
       }
     } else {
       TelnetPrint.print("Response not ready yet");
     }
   }
+  //localClient.close();
+  return toRet;
 }
 
-void requestFromEPEver() {
+bool sendRequestToLuna() {
+  TelnetPrint.println("Requesting Luna");
+  bool toRet = false;
+  WiFiClient localClient;
+  const uint port = 44001;
+  const char* ip = "192.168.30.156";
+  //http://192.168.30.156:44001/stats
+  latest_hashrate = 0.0;
+  String readRequest = "GET /stats HTTP/1.1\r\nHost: 192.168.30.156:44001\r\nConnection: close\r\n\r\n";
+
+  if (localClient.connect(ip, port)) {
+    TelnetPrint.println("Luna connect");
+    localClient.print(readRequest);
+    //localClient.println("GET /stats HTTP/1.0");
+    delay(100);
+
+    String last_line = "";
+    String line = "";
+    // check if response is waiting for us
+    while (localClient.available() > 0) {
+      line = localClient.readStringUntil('\n');
+      TelnetPrint.println("*" + line + "*");
+      //char c = localClient.read();
+      //TelnetPrint.print(c);
+      if(line != "" && line != "\n" && line != "\r\n" && line != "\r") {
+        last_line = line;
+      }
+      
+      //latest_hashrate = line.toFloat();
+      //latest_hashrate = (float)latest_hashrate/(float)1000;
+    }
+    TelnetPrint.print("Last line: ");
+    TelnetPrint.println(last_line);
+    if(last_line != "") {
+      //std::string delimiter = " ";
+      String token = last_line.substring(0, line.indexOf(' ')); // token is "scott"
+      latest_hashrate = token.toFloat();
+      latest_hashrate = (float)latest_hashrate/(float)1000;
+      toRet = true;
+      TelnetPrint.print("Hashrate: ");
+      TelnetPrint.println(latest_hashrate);
+    } else {
+      TelnetPrint.println("Last line is blank. :(");
+    }
+  } else {
+    TelnetPrint.print("Response not ready yet");
+  }
+  
+  return toRet;
+}
+
+bool requestFromEPEver() {
   //float rssi = WiFi.RSSI();
   //TelnetPrint.print("WiFi signal strength is: "); TelnetPrint.println(rssi);
   //TelnetPrint.print("WiFi signal strength is: "); TelnetPrint.println(rssi);
@@ -1671,6 +1716,7 @@ void requestFromEPEver() {
       if (data->everythingRead) {
           TelnetPrint.println("MODBUS everything read!");
 
+          /*
           TelnetPrint.print("pvPower: ");
           TelnetPrint.println(data->realtimeData.pvPower);
           TelnetPrint.print("pvCurrent: ");
@@ -1689,11 +1735,15 @@ void requestFromEPEver() {
           TelnetPrint.println(data->realtimeData.equipmentTemp);
           TelnetPrint.print("heatsinkTemp: ");
           TelnetPrint.println(data->realtimeData.heatsinkTemp);
+          */
       } else {
-        TelnetPrint.println("MODBUS missing something...");
+        TelnetPrint.println("requestFromEPEver->MODBUS missing something...");
+        return false;
       }
       //delay(1000);
+      return true;
   }
+  return false;
 
 /*
   uint8_t result;
