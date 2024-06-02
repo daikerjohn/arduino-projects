@@ -210,7 +210,16 @@ String status_str = "";
 const int STATUS_BUFFER_SIZE = 1500;
 char stat_char[STATUS_BUFFER_SIZE] = "";
 
-float latest_hashrate = 0.0;
+#define NUM_DEVICES 4
+
+int device_pins[NUM_DEVICES] = {21, 22, 0, 0};
+//#define RELAY_PIN_ONE 21
+//#define RELAY_PIN_TWO 22
+
+float latest_hashrates[NUM_DEVICES] = {0.0};
+String device_ips[NUM_DEVICES] = {""};
+int device_ports[NUM_DEVICES] = {44001};
+
 String str_ble_status = "";
 String str_http_status = "";
 String last_data_capture_bms = "";
@@ -261,8 +270,6 @@ const int num_data_points_sma = 10;
 const int num_data_points_decision = 8;
 
 // ESP32 - GPIO PIN 
-#define RELAY_PIN_ONE 21
-#define RELAY_PIN_TWO 22
 // Arduino Nano ESP32
 //#define RELAY_PIN 8
 
@@ -444,11 +451,14 @@ void setup() {
   Serial.begin(115200);
   Serial.println("Started!");
 
-  pinMode(RELAY_PIN_ONE, OUTPUT);
-  pinMode(RELAY_PIN_TWO, OUTPUT);
+  for(int x = 0; x < NUM_DEVICES; x++) {
+    if(device_pins[x] != 0) {
+      pinMode(device_pins[x], OUTPUT);
+    }
+  }
 
   //renogy_control_load(0);
-  turn_off_load("Load Off - Startup");
+  turn_off_load(-1, "Load Off - Startup");
 
   prefs.begin("solar-app", false);
   size_t whatsLeft = prefs.freeEntries();    // this method works regardless of the mode in which the namespace is opened.
@@ -477,6 +487,13 @@ void setup() {
     }
   }
   ble_autoconn = prefs.getBool("ble_autoconn", false);
+
+  for(int x = 0; x < NUM_DEVICES; x++) {
+    String ip_key = "device_ip_" + String(x);
+    String port_key = "device_port_" + String(x);
+    device_ips[x] = prefs.getString(ip_key.c_str(), "");
+    device_ports[x] = prefs.getInt(port_key.c_str(), 0);
+  }
 /*
   if(ssid == "" || strlen(ssid) < 3) {
     TelnetPrint.println("Setting default ssid...");
@@ -630,8 +647,13 @@ String structToString() {
     asdf += "\"last_update_time\": " + String(myData.last_update_time) + ",";
     asdf += "\"controller_connected\": " + String(myData.controller_connected);
     */
-    if (latest_hashrate > 0.0) {
-      asdf += "\"latest_hashrate\": " + String(latest_hashrate, 3) + ",";
+    if (latest_hashrates[0] > 0.0) {
+      asdf += "\"latest_hashrate\": " + String(latest_hashrates[0], 3) + ",";
+    }
+    for (int x = 1; x < NUM_DEVICES; x++) {
+      if(latest_hashrates[x] > 0.0) {
+        asdf += "\"latest_hashrate_" + String(x) + "\": " + String(latest_hashrates[x], 3) + ",";
+      }
     }
     asdf += "\"controller_connected\": " + String(BLE_client_connected);
 
@@ -730,10 +752,12 @@ String statsIndex() {
   data += "<p>***" + String(stat_char) + "***</p>";
 
   // If the load_running is on, it displays the OFF button
-  if (load_running) {
-    data += "<p><a href=\"/load/off\"><button class=\"button button2\">OFF</button></a></p>";
-  } else {
-    data += "<p><a href=\"/load/on\"><button class=\"button\">ON</button></a></p>";
+  //if (load_running) {
+    data += "<p><a href=\"/load/off\"><button class=\"button button2\">All OFF</button></a><a href=\"/load/on\"><button class=\"button\">All ON</button></a></p>";
+  //}
+  for(int x = 0; x < NUM_DEVICES; x++) {
+    data += "<p><a href=\"/load/off?device=" + String(x) + "\"><button class=\"button button2\">" + String(x) + " OFF</button></a>";
+    data += "<a href=\"/load/on?device=" + String(x) + "\"><button class=\"button\">" + String(x) + " ON</button></a></p>";
   }
 
   data += htmlFoot();
@@ -744,31 +768,28 @@ String configIndex() {
   String data = htmlHead(false);
 
   data += "<form action=\"/set\">Enter an batt_cap_ah: <input type=\"text\" name=\"batt_cap_ah\" value=\"" + String(batt_cap_ah) + "\"><br/>";
-  data += "<input type=\"submit\" value=\"Submit\"></form>";
-  data += "<form action=\"/set\">Enter an batt_soc_min: <input type=\"text\" name=\"batt_soc_min\" value=\"" + String(batt_soc_min) + "\"><br/>";
-  data += "<input type=\"submit\" value=\"Submit\"></form>";
-  data += "<form action=\"/set\">Enter an batt_soc_start: <input type=\"text\" name=\"batt_soc_start\" value=\"" + String(batt_soc_start) + "\"><br/>";
-  data += "<input type=\"submit\" value=\"Submit\"></form>";
-  data += "<form action=\"/set\">Enter an batt_volt_min: <input type=\"text\" name=\"batt_volt_min\" value=\"" + String(batt_volt_min) + "\"><br/>";
-  data += "<input type=\"submit\" value=\"Submit\"></form>";
-  data += "<form action=\"/set\">Enter an batt_voltage: <input type=\"text\" name=\"batt_voltage\" value=\"" + String(batt_voltage) + "\"><br/>";
-  data += "<input type=\"submit\" value=\"Submit\"></form>";
-  data += "<form action=\"/set\">Enter an bat_volt_start: <input type=\"text\" name=\"bat_volt_start\" value=\"" + String(bat_volt_start) + "\"><br/>";
-  data += "<input type=\"submit\" value=\"Submit\"></form>";
-  data += "<form action=\"/set\">Enter an shut_cool_ms: <input type=\"text\" name=\"shut_cool_ms\" value=\"" + String(shut_cool_ms) + "\"><br/>";
+  data += "Enter an batt_soc_min: <input type=\"text\" name=\"batt_soc_min\" value=\"" + String(batt_soc_min) + "\"><br/>";
+  data += "Enter an batt_soc_start: <input type=\"text\" name=\"batt_soc_start\" value=\"" + String(batt_soc_start) + "\"><br/>";
+  data += "Enter an batt_volt_min: <input type=\"text\" name=\"batt_volt_min\" value=\"" + String(batt_volt_min) + "\"><br/>";
+  data += "Enter an batt_voltage: <input type=\"text\" name=\"batt_voltage\" value=\"" + String(batt_voltage) + "\"><br/>";
+  data += "Enter an bat_volt_start: <input type=\"text\" name=\"bat_volt_start\" value=\"" + String(bat_volt_start) + "\"><br/>";
+  data += "Enter an shut_cool_ms: <input type=\"text\" name=\"shut_cool_ms\" value=\"" + String(shut_cool_ms) + "\"><br/>";
   data += "<input type=\"submit\" value=\"Submit\"></form>";
 
   data += "<form action=\"/set\">Enter a ssid: <input type=\"text\" name=\"ssid\" value=\"" + String(ssid_str) + "\"><br/>";
-  data += "<input type=\"submit\" value=\"Submit\"></form>";
-  data += "<form action=\"/set\">Enter a password: <input type=\"text\" name=\"password\" value=\"" + String(password_str) + "\"><br/>";
+  data += "Enter a password: <input type=\"text\" name=\"password\" value=\"" + String(password_str) + "\"><br/>";
   data += "<input type=\"submit\" value=\"Submit\"></form>";
 
   data += "<form action=\"/set\">Allow Automatic: <input type=\"text\" name=\"allow_auto\" value=\"" + String(allow_auto) + "\"><br/>";
+  data += "BLE Auto Connect: <input type=\"text\" name=\"ble_autoconn\" value=\"" + String(ble_autoconn) + "\"><br/>";
   data += "<input type=\"submit\" value=\"Submit\"></form>";
 
-  data += "<form action=\"/set\">BLE Auto Connect: <input type=\"text\" name=\"ble_autoconn\" value=\"" + String(ble_autoconn) + "\"><br/>";
+  data += "<form action=\"/set\">";
+  for(int x = 0; x < NUM_DEVICES; x++) {
+    data += "Device IP: <input type=\"text\" name=\"device_ip_" + String(x) + "\" value=\"" + device_ips[x] + "\"><br/>";
+    data += "Device Ports: <input type=\"text\" name=\"device_port_" + String(x) + "\" value=\"" + String(device_ports[x]) + "\"><br/>";  
+  }
   data += "<input type=\"submit\" value=\"Submit\"></form>";
-
   //data += "<form action=\"/set\">BLE Auto Connect: <input type=\"text\" name=\"ble_autoconn\" value=\"" + String(ble_autoconn) + "\"><br/>";
   //data += "<input type=\"submit\" value=\"Submit\"></form>";
 
@@ -866,24 +887,40 @@ String rawIndex(bool asPlaintext = true) {
   return data;
 }
 
-void turn_off_load(String decision) {
+void turn_off_load(int device_number, String decision) {
   if (decision != "") {
-    automatic_decision = decision + " @ " + getTimestamp();
+    automatic_decision = decision + " dev " + String(device_number) + " @ " + getTimestamp();
     automatic_decisions.push(automatic_decision);
     AppendStatus(automatic_decision);
   }
-  renogy_control_load(0, RELAY_PIN_ONE);
-  renogy_control_load(0, RELAY_PIN_TWO);
+  // all devices
+  if(device_number == -1) {
+    for(int x = 0; x < NUM_DEVICES; x++) {
+      renogy_control_load(0, device_pins[x]);
+    }
+  } else {
+    renogy_control_load(0, device_pins[device_number]);
+  }
+  //renogy_control_load(0, RELAY_PIN_ONE);
+  //renogy_control_load(0, RELAY_PIN_TWO);
 }
 
-void power_on_load(String decision) {
+void power_on_load(int device_number, String decision) {
   if (decision != "") {
-    automatic_decision = decision + " @ " + getTimestamp();
+    automatic_decision = decision + " dev " + String(device_number) + " @ " + getTimestamp();
     automatic_decisions.push(automatic_decision);
     AppendStatus(automatic_decision);
   }
-  renogy_control_load(1, RELAY_PIN_ONE);
-  renogy_control_load(1, RELAY_PIN_TWO);
+  // all devices
+  if(device_number == -1) {
+    for(int x = 0; x < NUM_DEVICES; x++) {
+      renogy_control_load(1, device_pins[x]);
+    }
+  } else {
+    renogy_control_load(1, device_pins[device_number]);
+  }
+  //renogy_control_load(1, RELAY_PIN_ONE);
+  //renogy_control_load(1, RELAY_PIN_TWO);
 }
 
 void handle_webserver_connection() {
@@ -911,7 +948,7 @@ void handle_webserver_connection() {
     status_str = "";
     stat_char[0] = '\0';
     update_decisions(false);
-    request->send(200, "text/plain", structToString());
+    request->send(200, "application/json", structToString());
   });
   server.on("/restart", HTTP_GET, [](AsyncWebServerRequest *request) {
     ESP.restart();
@@ -932,12 +969,26 @@ void handle_webserver_connection() {
 
   // Load control
   server.on("/load/on", HTTP_GET, [](AsyncWebServerRequest *request) {
-    power_on_load("Load On - Manual");
+    int device = -1;
+    if(request->hasParam("device")) {
+      device = std::stoi(request->getParam("device")->value().c_str());
+    }
+    TelnetPrint.println("Device: " + String(device));
+    power_on_load(device, "Load On - Manual");
     last_action_was_manual = true;
     request->redirect("/");
   });
   server.on("/load/off", HTTP_GET, [](AsyncWebServerRequest *request) {
-    turn_off_load("Load Off - Manual");
+    int device = -1;
+    if(request->hasParam("device")) {
+      device = std::stoi(request->getParam("device")->value().c_str());
+    }
+    TelnetPrint.println("Device: " + String(device));
+    //AsyncWebParameter* p = request->getParam("device")->value();
+    //if(p->name() == "device") {
+    //  TelnetPrint.println("Device:" + String(request->getParam("device")->value());
+    //}
+    turn_off_load(device, "Load Off - Manual");
     last_action_was_manual = true;
     request->redirect("/");
   });
@@ -985,7 +1036,12 @@ void handle_webserver_connection() {
         || request->hasArg("ssid")
         || request->hasArg("password")
         || request->hasArg("allow_auto")
-        || request->hasArg("ble_autoconn")) {
+        || request->hasArg("ble_autoconn")
+        || request->hasArg("device_ip_0") || request->hasArg("device_port_0")
+        || request->hasArg("device_ip_1") || request->hasArg("device_port_1")
+        || request->hasArg("device_ip_2") || request->hasArg("device_port_2")
+        || request->hasArg("device_ip_3") || request->hasArg("device_port_3")
+        ) {
       if (prefs.begin("solar-app", false)) {
         if (request->hasArg("batt_cap_ah")) {
           input_value = request->arg("batt_cap_ah");
@@ -1044,6 +1100,20 @@ void handle_webserver_connection() {
           ble_autoconn = std::stoi(input_value.c_str());
           //str_ble_status += "storing ble_autoconn = " + String(ble_autoconn);
           prefs.putBool("ble_autoconn", ble_autoconn);
+        }
+        for(int x = 0; x < NUM_DEVICES; x++) {
+          String ip_key = "device_ip_" + String(x);
+          if (request->hasArg(ip_key.c_str())) {
+            input_value = request->arg(ip_key.c_str());
+            device_ips[x] = input_value;
+            prefs.putString(ip_key.c_str(), device_ips[x]);
+          }
+          String port_key = "device_port_" + String(x);
+          if (request->hasArg(port_key.c_str())) {
+            input_value = request->arg(port_key.c_str());
+            device_ports[x] = std::stoi(input_value.c_str());
+            prefs.putInt(port_key.c_str(), device_ports[x]);
+          }
         }
         delay(100);
         prefs.end();
@@ -1127,13 +1197,13 @@ void update_decisions(bool allow_automatic) {
     if (load_running && avg_batt_volts < batt_volt_min) {
       if (allow_automatic) {
         last_action_was_manual = false;
-        turn_off_load("Turn load off (voltage) " + String(avg_batt_volts) + " < " + String(batt_volt_min));
+        turn_off_load(-1, "Turn load off (voltage) " + String(avg_batt_volts) + " < " + String(batt_volt_min));
       }
     } else {
       if (load_running && avg_batt_soc < batt_soc_min) {
         if (allow_automatic) {
           last_action_was_manual = false;
-          turn_off_load("Turn load off (battery soc) " + String(avg_batt_soc) + " < " + String(batt_soc_min));
+          turn_off_load(-1, "Turn load off (battery soc) " + String(avg_batt_soc) + " < " + String(batt_soc_min));
         }
       } else {
         if (load_running) {
@@ -1145,7 +1215,7 @@ void update_decisions(bool allow_automatic) {
               if (next_available_startup != 0 && millis() > next_available_startup) {
                 if (allow_automatic && net_avg_system_amps > 0) {
                   last_action_was_manual = false;
-                  power_on_load("Turn on load");
+                  power_on_load(-1, "Turn on loads");
                 }
                 current_status = "";
               } else {
@@ -1274,9 +1344,13 @@ void loop() {
     if(requestFromEPEver()) {
       last_data_capture_scc = getTimestamp();
     }
-    if(!sendRequestToAstro()) {
-      sendRequestToLuna();
+    //if(!sendRequestToAstro()) {
+    for(int x = 0; x < NUM_DEVICES; x++) {
+      //sendRequestToLuna(x, "192.168.30.156", 44001);
+      sendRequestToLuna(x, device_ips[x], device_ports[x]);
     }
+    
+    //}
 
     if((float)packBasicInfo.CapacityRemainPercent > 0.0) {
       battery_voltage_queue.push((float)packBasicInfo.Volts / 1000);
@@ -1567,7 +1641,9 @@ void renogy_read_info_registers()
 
 // control the load pins on Renogy charge controllers that have them
 void renogy_control_load(bool state, int pin) {
-  
+  if(pin == 0) {
+    return;
+  }
   // The relays I use are wired backwards!?  So this HIGH/LOW are switched from what they'd normally be...
   // Moderately annoying.
   if (state) {
@@ -1582,14 +1658,15 @@ void renogy_control_load(bool state, int pin) {
   //else node.writeSingleRegister(0x010A, 0);  // turn off load
 }
 
-bool sendRequestToAstro() {
+bool sendRequestToAstro(int device_index) {
   TelnetPrint.println("Requesting Astro");
   bool toRet = false;
   WiFiClient localClient;
   // Astrominer API
   const uint port = 60666;
   const char* ip = "192.168.30.155";
-  latest_hashrate = 0.0;
+  double hashrate = 0.0;
+  latest_hashrates[device_index] = 0.0;
 
   if (localClient.connect(ip, port)) {
     if (localClient.connected()) {
@@ -1625,10 +1702,10 @@ bool sendRequestToAstro() {
         thing.replace("[", "");
         thing.replace("]", "");
         //TelnetPrint.println(thing);
-        latest_hashrate = thing.toFloat();
+        hashrate = thing.toFloat();
         toRet = true;
         TelnetPrint.print("Latest hashrate json: ");
-        TelnetPrint.println(latest_hashrate);
+        TelnetPrint.println(hashrate);
       }
       */
       if(str != "") {
@@ -1640,10 +1717,11 @@ bool sendRequestToAstro() {
         token.replace("[", "");
         token.replace("]", "");
         token.replace("\"", "");
-        latest_hashrate = token.toFloat();
+        hashrate = token.toFloat();
+        latest_hashrates[device_index] = hashrate;
         toRet = true;
         TelnetPrint.print("Latest hashrate str: ");
-        TelnetPrint.println(latest_hashrate);
+        TelnetPrint.println(hashrate);
       }
     } else {
       TelnetPrint.print("Response not ready yet");
@@ -1653,17 +1731,18 @@ bool sendRequestToAstro() {
   return toRet;
 }
 
-bool sendRequestToLuna() {
+bool sendRequestToLuna(int device_index, String ip, const uint port) {
   TelnetPrint.println("Requesting Luna");
   bool toRet = false;
   WiFiClient localClient;
-  const uint port = 44001;
-  const char* ip = "192.168.30.156";
+  //const uint port = 44001;
+  //const char* ip = "192.168.30.156";
   //http://192.168.30.156:44001/stats
-  latest_hashrate = 0.0;
-  String readRequest = "GET /stats HTTP/1.1\r\nHost: 192.168.30.156:44001\r\nConnection: close\r\n\r\n";
+  double hashrate = 0.0;
+  latest_hashrates[device_index] = 0.0;
+  String readRequest = "GET /stats HTTP/1.1\r\nHost: " + ip + ":" + String(port) + "\r\nConnection: close\r\n\r\n";
 
-  if (localClient.connect(ip, port)) {
+  if (localClient.connect(ip.c_str(), port)) {
     TelnetPrint.println("Luna connect");
     localClient.print(readRequest);
     //localClient.println("GET /stats HTTP/1.0");
@@ -1681,19 +1760,20 @@ bool sendRequestToLuna() {
         last_line = line;
       }
       
-      //latest_hashrate = line.toFloat();
-      //latest_hashrate = (float)latest_hashrate/(float)1000;
+      //hashrate = line.toFloat();
+      //hashrate = (float)hashrate/(float)1000;
     }
     TelnetPrint.print("Last line: ");
     TelnetPrint.println(last_line);
     if(last_line != "") {
       //std::string delimiter = " ";
       String token = last_line.substring(0, line.indexOf(' ')); // token is "scott"
-      latest_hashrate = token.toFloat();
-      latest_hashrate = (float)latest_hashrate/(float)1000;
+      hashrate = token.toFloat();
+      hashrate = (float)hashrate/(float)1000;
+      latest_hashrates[device_index] = hashrate;
       toRet = true;
       TelnetPrint.print("Hashrate: ");
-      TelnetPrint.println(latest_hashrate);
+      TelnetPrint.println(hashrate);
     } else {
       TelnetPrint.println("Last line is blank. :(");
     }
