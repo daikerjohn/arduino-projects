@@ -148,6 +148,7 @@ void bleRequestData()
             TelnetPrint.println("We are now Connected in bleRequestData");
             str_ble_status += getTimestamp() + " - Connected\n";
             doConnect = false;
+            BLE_client_connected = true;
         }
     }
 
@@ -155,8 +156,7 @@ void bleRequestData()
     // with the current time since boot.
     if (BLE_client_connected == true)
     {
-                  TelnetPrint.println("BLE_client_connected ==true");
-
+        TelnetPrint.println("BLE_client_connected ==true");
         unsigned long currentMillis = millis();
         if ((currentMillis - previousMillis >= interval || newPacketReceived)) //every time period or when packet is received
         {
@@ -249,7 +249,8 @@ class AdvertisedDeviceCallbacks: public NimBLEAdvertisedDeviceCallbacks {
 static void notifyCallbackTwo(BLERemoteCharacteristic* pBLERemoteCharacteristic, uint8_t* pData, size_t length,bool isNotify) {
   TelnetPrint.printf("Notify callback for characteristic %s of data length %d\n",
           pBLERemoteCharacteristic->getUUID().toString().c_str(), length);
-  //hexDump((char*)pData, length);
+  hexDump((char*)pData, length);
+  last_data_size = length;
   bleCollectPacket((char *)pData, length);
 }
 
@@ -304,6 +305,7 @@ bool connectToServer()
     }
 
     // Obtain a reference to the characteristic in the service of the remote BLE server.
+    TelnetPrint.println("pClientOld->getCharacteristic");
     pRemoteCharacteristic = pRemoteService->getCharacteristic(charUUID_rx);
     if (pRemoteCharacteristic == nullptr)
     {
@@ -313,19 +315,26 @@ bool connectToServer()
         return false;
     }
 
+    TelnetPrint.println("pRemoteCharacteristic->canRead");
     // Read the value of the characteristic.
     if (pRemoteCharacteristic->canRead())
     {
         std::string value = pRemoteCharacteristic->readValue();
     }
 
+    TelnetPrint.println("pRemoteCharacteristic->canNotify");
     if (pRemoteCharacteristic->canNotify()) {
-        pRemoteCharacteristic->subscribe(true, notifyCallbackTwo);
+        TelnetPrint.println("pRemoteCharacteristic->subscribe");
+        if(pRemoteCharacteristic->subscribe(true, notifyCallbackTwo, true)) {
+          TelnetPrint.println("client_connected");
+          BLE_client_connected = true;
+        } else {
+          TelnetPrint.println("Failed to subscribe");
+        }
     } else {
       TelnetPrint.println("Cannot subscribe to rx characteristic");
     }
 
-    BLE_client_connected = true;
     return BLE_client_connected;
 }
 

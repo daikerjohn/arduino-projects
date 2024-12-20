@@ -224,6 +224,7 @@ String str_ble_status = "";
 String str_http_status = "";
 String last_data_capture_bms = "";
 String last_data_capture_scc = "";
+int last_data_size = 0;
 
 //For UTC -8.00 : -8 * 60 * 60 : -28800
 const long gmtOffset_sec = -28800;
@@ -243,9 +244,8 @@ bool ble_autoconn = false;
 //const char *password = "07570377";
 
 //Your Domain name with URL path or IP address with path
-//const char *serverName = "https://lhbqdvca46.execute-api.us-west-2.amazonaws.com/dev/solar";
-//String serverName = "https://us-west-2.aws.data.mongodb-api.com/app/solar-0-cvgqn/endpoint/createSolar";
-const String serverName = "http://192.168.10.61:3000/dev/solar";
+//const String serverName = "http://192.168.10.61:3000/dev/solar";
+String reportingUrl_str = "http://192.168.10.61:3000/dev/solar";
 
 
 unsigned long currentMillis = 0;
@@ -363,11 +363,17 @@ public:
     }
     std::queue<T, Container>::push(value);
   }
-  String html() {
+  String html(bool reverse = false) {
     //int num_valid = 0;
     String asdf = "";
-    for (int y = 0; y < this->size(); y++) {
-      asdf += "<p>" + String(this->c[y]) + "</p>";
+    if(reverse) {
+      for (int y = this->size()-1; y >= 0; y--) {
+        asdf += "<p>" + String(this->c[y]) + "</p>";
+      }
+    } else {
+      for (int y = 0; y < this->size(); y++) {
+        asdf += "<p>" + String(this->c[y]) + "</p>";
+      }
     }
     return asdf;
   }
@@ -494,6 +500,7 @@ void setup() {
     device_ips[x] = prefs.getString(ip_key.c_str(), "");
     device_ports[x] = prefs.getInt(port_key.c_str(), 0);
   }
+  reportingUrl_str = prefs.getString("report_url", "http://192.168.10.61:3000/dev/solar");
 /*
   if(ssid == "" || strlen(ssid) < 3) {
     TelnetPrint.println("Setting default ssid...");
@@ -713,7 +720,8 @@ text-decoration: none; font-size: 30px; margin: 2px; cursor: pointer;}
 String htmlFoot() {
   String data = "<p>Compiled: " + String(compile_date) + "</p>";
   data += "<p><a href='/'>Home</a> | <a href='/raw'>raw</a> | <a href='/json'>json</a> | <a href='/config'>Config</a> | <a href='/update'>Update</a> | <a href='/restart'>restart</a></p>";
-  data += "<p><a href='/ble'>BLE</a> | <a href='/bledisc'>BLE Disconn</a> | <a href='/bleconn'>BLE Connect</a> | <a href='/blereq'>BLE Request</a> | <a href='/bleclearstr'>BLE ClearString</a></p>";
+  data += "<br/>";
+  data += "<p><a href='/ble'>BLE</a> | <a href='/bledisc'>BLE Disconn</a> | <a href='/bleconn'>BLE Connect</a> | <a href='/blereq'>BLE Request</a> | <a href='/bleclearstr'>BLE ClearString</a> | <a href='/bleinit'>BLE Init</a></p>";
   data += "</body></html>";
   return data;
 }
@@ -741,7 +749,7 @@ String statsIndex() {
     data += "<p>Last Automatic: " + String(automatic_decision) + "</p>";
   }
   data += "<p>Automatics: " + String(allow_auto ? "On" : "Off") + "</p>";
-  data += automatic_decisions.html();
+  data += automatic_decisions.html(true);
 
   data += "<p>Last BMS Data Capture: " + last_data_capture_bms + "</p>";
   data += "<p>Last SCC Data Capture: " + last_data_capture_scc + "</p>";
@@ -789,6 +797,9 @@ String configIndex() {
     data += "Device IP: <input type=\"text\" name=\"device_ip_" + String(x) + "\" value=\"" + device_ips[x] + "\"><br/>";
     data += "Device Ports: <input type=\"text\" name=\"device_port_" + String(x) + "\" value=\"" + String(device_ports[x]) + "\"><br/>";  
   }
+  data += "<input type=\"submit\" value=\"Submit\"></form>";
+
+  data += "<form action=\"/set\">Reporting URL: <input type=\"text\" name=\"report_url\" value=\"" + String(reportingUrl_str) + "\"><br/>";
   data += "<input type=\"submit\" value=\"Submit\"></form>";
   //data += "<form action=\"/set\">BLE Auto Connect: <input type=\"text\" name=\"ble_autoconn\" value=\"" + String(ble_autoconn) + "\"><br/>";
   //data += "<input type=\"submit\" value=\"Submit\"></form>";
@@ -864,6 +875,9 @@ String rawIndex(bool asPlaintext = true) {
   snprintf(sBuff + strlen(sBuff), BUFFERSIZE - strlen(sBuff), "%s", endline);
 
   snprintf(sBuff + strlen(sBuff), BUFFERSIZE - strlen(sBuff), "Median cell volt: %.3f", (float)packCellInfo.CellMedian / 1000);
+  snprintf(sBuff + strlen(sBuff), BUFFERSIZE - strlen(sBuff), "%s", endline);
+
+  snprintf(sBuff + strlen(sBuff), BUFFERSIZE - strlen(sBuff), "Latest data size: %d", last_data_size);
   snprintf(sBuff + strlen(sBuff), BUFFERSIZE - strlen(sBuff), "%s", endline);
 
   String data = sBuff;
@@ -993,6 +1007,12 @@ void handle_webserver_connection() {
     request->redirect("/");
   });
 
+  server.on("/bleinit", HTTP_GET, [](AsyncWebServerRequest *request) {
+    str_ble_status += getTimestamp() + " - BLE - Connect\n";
+    bleStartup();
+    request->redirect("/");
+  });
+
   server.on("/bleconn", HTTP_GET, [](AsyncWebServerRequest *request) {
     str_ble_status += getTimestamp() + " - BLE - Connect\n";
     if(!ble_autoconn) {
@@ -1041,6 +1061,7 @@ void handle_webserver_connection() {
         || request->hasArg("device_ip_1") || request->hasArg("device_port_1")
         || request->hasArg("device_ip_2") || request->hasArg("device_port_2")
         || request->hasArg("device_ip_3") || request->hasArg("device_port_3")
+        || request->hasArg("report_url")
         ) {
       if (prefs.begin("solar-app", false)) {
         if (request->hasArg("batt_cap_ah")) {
@@ -1114,6 +1135,11 @@ void handle_webserver_connection() {
             device_ports[x] = std::stoi(input_value.c_str());
             prefs.putInt(port_key.c_str(), device_ports[x]);
           }
+        }
+        if (request->hasArg("report_url")) {
+          input_value = request->arg("report_url");
+          reportingUrl_str = input_value;
+          prefs.putString("report_url", reportingUrl_str);
         }
         delay(100);
         prefs.end();
@@ -1345,7 +1371,7 @@ void loop() {
       last_data_capture_scc = getTimestamp();
     }
     //if(!sendRequestToAstro()) {
-    for(int x = 0; x < NUM_DEVICES; x++) {
+    for(int x = 0; x < NUM_DEVICES && device_pins[x] != 0; x++) {
       //sendRequestToLuna(x, "192.168.30.156", 44001);
       sendRequestToLuna(x, device_ips[x], device_ports[x]);
     }
@@ -1391,7 +1417,7 @@ void loop() {
         //wifiSecureCli.setInsecure();
 
         // Your Domain name with URL path or IP address with path
-        theHttpClient.begin(wifiCli, serverName);
+        theHttpClient.begin(wifiCli, reportingUrl_str);
 
         // If you need Node-RED/server authentication, insert user and password below
         //http.setAuthorization("REPLACE_WITH_SERVER_USERNAME", "REPLACE_WITH_SERVER_PASSWORD");
@@ -1409,7 +1435,7 @@ void loop() {
         int httpResponseCode = theHttpClient.POST(httpRequestData);
         //int httpResponseCode = 200;
 
-        TelnetPrint.printf("HTTP Response code: %d\n", httpResponseCode);
+        TelnetPrint.println("HTTP Response code: " + String(httpResponseCode));
         AppendStatus("Latest Posting Reponse Code: " + String(httpResponseCode));
         str_http_status += "Latest Posting Reponse Code: " + String(httpResponseCode);
 
@@ -1742,7 +1768,7 @@ bool sendRequestToLuna(int device_index, String ip, const uint port) {
   latest_hashrates[device_index] = 0.0;
   String readRequest = "GET /stats HTTP/1.1\r\nHost: " + ip + ":" + String(port) + "\r\nConnection: close\r\n\r\n";
 
-  if (localClient.connect(ip.c_str(), port)) {
+  if (localClient.connect(ip.c_str(), port, 2000)) {
     TelnetPrint.println("Luna connect");
     localClient.print(readRequest);
     //localClient.println("GET /stats HTTP/1.0");
