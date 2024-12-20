@@ -1,6 +1,5 @@
 #include "esp_camera.h"
 #include <WiFi.h>
-#include "CStreamer.h"
 
 //
 // WARNING!!! PSRAM IC required for UXGA resolution and high JPEG quality
@@ -49,9 +48,6 @@ class TimerCamRTSP : public CStreamer {
 		  fb = esp_camera_fb_get();
 		  //if(_camera.get()) {
       if (fb) {
-        setWidthHeight(fb->width, fb->height);
-        //m_width=fb->width;
-        //m_height=fb->height;
         streamFrame(fb->buf, fb->len, millis());
         //_camera.free();
 			  esp_camera_fb_return(fb);
@@ -136,10 +132,8 @@ void setup() {
     s->set_saturation(s, -2); // lower the saturation
   }
   // drop down frame size for higher initial frame rate
-  // https://github.com/espressif/esp32-camera/blob/master/driver/include/sensor.h#L105
   if(config.pixel_format == PIXFORMAT_JPEG){
-    //s->set_framesize(s, FRAMESIZE_QVGA);
-    s->set_framesize(s, FRAMESIZE_FHD);
+    s->set_framesize(s, FRAMESIZE_QVGA);
   }
 
 #if defined(CAMERA_MODEL_M5STACK_WIDE) || defined(CAMERA_MODEL_M5STACK_ESP32CAM)
@@ -169,12 +163,11 @@ void setup() {
   
   fb = esp_camera_fb_get();
   if (!fb) {
-    Serial.println("Camera capture failed");
+    ESP_LOGE(TAG, "Camera capture failed");
     //res = ESP_FAIL;
   } else {
     streamer   = new TimerCamRTSP(fb->width, fb->height);
   }
-  server.begin();
 }
 
 void loop() {
