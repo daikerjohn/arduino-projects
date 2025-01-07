@@ -67,7 +67,6 @@ double coinBalancesByCoin[NUM_COINS] = {0.0, 0.0, 0.0};
 
 String Hello="Hello World!";
 bool first_loop = true;
-double totalBalance = 0.0;
 
 
 String getTimestamp(bool doShort=false) {
@@ -142,7 +141,7 @@ function initWebSocket() {
 // When websocket is established, call the getReadings() function
 function onOpen(event) {
     console.log('Connection opened');
-    getReadings();
+    //getReadings();
 }
 
 function onClose(event) {
@@ -228,7 +227,7 @@ String statsIndex() {
   }
 
   data += "</br><p>" + getTimestamp(true) + "</p>";
-  data += "<p>$" + String(totalBalance, 2) + "</p>";
+  data += "<p>$" + String(totalBal, 2) + "</p>";
 
   /*
   // Display current state of the Renogy load
@@ -643,7 +642,7 @@ void loop() {
     }
   }
 
-  totalBalance=0.0;
+  double totalBalance=0.0;
   for(int x = 0; x < NUM_COINS && coin_symbols[x] != ""; x++) {
     lcd.clear();
     for(int y = 0; y < NUM_LINES; y++) {
