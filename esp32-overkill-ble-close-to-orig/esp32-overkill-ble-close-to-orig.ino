@@ -131,14 +131,14 @@ const char *realtimeMetricNames[] = {"PV_array_voltage",
 
 #define TRACE
 //#include <Arduino.h>
-//#include "BLEDevice.h"
-#include "NimBLEDevice.h"
+#include <NimBLEDevice.h>
 #include "mydatatypes.h"
 //#include <Wire.h>
 
-static NimBLEClient *pClientOld;
-
 //---- global variables ----
+static const NimBLEAdvertisedDevice* advDevice = nullptr;
+static constexpr uint32_t bleScanTimeMs = 10 * 1000;
+
 static boolean doConnect = false;
 static boolean BLE_client_connected = false;
 static boolean doScan = false;
@@ -151,7 +151,7 @@ const byte cBasicInfo3 = 3;  //type of packet 3= basic info
 const byte cCellInfo4 = 4;   //type of packet 4= individual cell info
 
 unsigned long previousMillis = 0;
-const long interval = 5000;
+//const long interval = 15000;
 
 bool toggle = false;
 bool newPacketReceived = false;
@@ -558,17 +558,21 @@ void setup() {
 
   delay(100);
 
-  str_ble_status += "BLE Autoconn: " + String(ble_autoconn);
-  if (ble_autoconn) {
-    bleStartup();
-  }
-  Serial.println("After bleStartup");
+  //str_ble_status += "BLE Autoconn: " + String(ble_autoconn);
+  //if (ble_autoconn) {
+  //  //bleStartup();
+  //  bleRequestData();
+  //}
+  //Serial.println("After bleRequestData");
 
   tracer.begin();
   Serial.println("After tracer.begin()");
 
   boot_time_str = getTimestamp();
   Serial.println("After getTimestamp()");
+  
+  Serial.println("initBle");
+  initBle();
 }
 
 String structToString() {
@@ -1009,15 +1013,16 @@ void handle_webserver_connection() {
 
   server.on("/bleinit", HTTP_GET, [](AsyncWebServerRequest *request) {
     str_ble_status += getTimestamp() + " - BLE - Connect\n";
-    bleStartup();
+    //bleStartup();
+    initBle();
     request->redirect("/");
   });
 
   server.on("/bleconn", HTTP_GET, [](AsyncWebServerRequest *request) {
     str_ble_status += getTimestamp() + " - BLE - Connect\n";
-    if(!ble_autoconn) {
-      bleStartup();
-    }
+    //if(!ble_autoconn) {
+    //  bleStartup();
+    //}
     connectToServer();
     //turn_off_load("Load Off - Manual");
     request->redirect("/");
@@ -1035,14 +1040,9 @@ void handle_webserver_connection() {
   });
 
   server.on("/bledisc", HTTP_GET, [](AsyncWebServerRequest *request) {
+    bleDisconnect();
 
-    pClientOld->disconnect();
-    //BLEDevice::deinit(false);
-    //doConnect = false;
-    //BLE_client_connected = false;
-    //doScan = false;
-
-    str_ble_status += getTimestamp() + " - BLE - Disconnect\n";
+    str_ble_status = getTimestamp() + " - BLE - Disconnect\n";
     last_data_capture_bms = "Disconnected";
     //turn_off_load("Load Off - Manual");
     request->redirect("/");
@@ -1362,18 +1362,17 @@ void loop() {
     TelnetPrint.println("Updating data");
     status_str = "";
     stat_char[0] = '\0';
-    if(!first_loop) {
-      TelnetPrint.println("bleRequestData");
-      bleRequestData();
-    }
+    bleRequestData();
     
     if(requestFromEPEver()) {
       last_data_capture_scc = getTimestamp();
     }
     //if(!sendRequestToAstro()) {
-    for(int x = 0; x < NUM_DEVICES && device_pins[x] != 0; x++) {
-      //sendRequestToLuna(x, "192.168.30.156", 44001);
-      sendRequestToLuna(x, device_ips[x], device_ports[x]);
+    if(!first_loop) {
+      for(int x = 0; x < NUM_DEVICES && device_pins[x] != 0; x++) {
+        //sendRequestToLuna(x, "192.168.30.156", 44001);
+        sendRequestToLuna(x, device_ips[x], device_ports[x]);
+      }
     }
     
     //}

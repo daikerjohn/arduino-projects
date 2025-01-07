@@ -1,7 +1,7 @@
 //  ----- BLE stuff -----
-static NimBLERemoteCharacteristic *pRemoteCharacteristic;
-static NimBLEAdvertisedDevice *myDevice;
-NimBLERemoteService *pRemoteService;
+static NimBLERemoteService *pRemoteService = nullptr;
+static NimBLERemoteCharacteristic *pRemoteCharacteristic_overkill = nullptr;
+
 // The remote service we wish to connect to. Needs check/change when other BLE module used.
 static NimBLEUUID serviceUUID("0000ff00-0000-1000-8000-00805f9b34fb"); //xiaoxiang bms original module
 // https://github.com/FurTrader/OverkillSolarBMS/blob/master/Comm_Protocol_Documentation/BLE%20_bluetooth_protocol.md#executive-summary
@@ -30,125 +30,86 @@ static uint32_t scanTime = 0; /** 0 = scan forever */
 // Write this characteristic to send data to BMS
 // READ, WRITE, WRITE NO RESPONSE
 
-class MyAdvertisedDeviceCallbacks : public NimBLEAdvertisedDeviceCallbacks
-{ //this is called by some underlying magic
-    /**
-	* Called for each advertising BLE server.
-	*/
-    void onResult(NimBLEAdvertisedDevice* advertisedDevice)
-    {
-        //commSerial.print("BLE Advertised Device found: ");
-        //commSerial.println(advertisedDevice->toString().c_str());
-        TelnetPrint.println(getTimestamp() + " - onResult " + advertisedDevice->toString().c_str());
 
-        // We have found a device, let us now see if it contains the service we are looking for.
-        if (advertisedDevice->haveServiceUUID() && advertisedDevice->isAdvertisingService(serviceUUID))
-        {
-            TelnetPrint.println("overkill UUID matches");
-            NimBLEDevice::getScan()->stop();
-            myDevice = advertisedDevice;
-            doConnect = true;
-            doScan = true;
-        } // Found our server
-    }     // onResult
-};        // MyAdvertisedDeviceCallbacks
 
-class MyClientCallback : public NimBLEClientCallbacks
-{ //this is called on connect / disconnect by some underlying magic+
-    void onConnect(NimBLEClient* pClient) {
-        TelnetPrint.println("Connected");
-        /** After connection we should change the parameters if we don't need fast response times.
-         *  These settings are 150ms interval, 0 latency, 450ms timout.
-         *  Timeout should be a multiple of the interval, minimum is 100ms.
-         *  I find a multiple of 3-5 * the interval works best for quick response/reconnect.
-         *  Min interval: 120 * 1.25ms = 150, Max interval: 120 * 1.25ms = 150, 0 latency, 60 * 10ms = 600ms timeout
+
+/**  None of these are required as they will be handled by the library with defaults. **
+ **                       Remove as you see fit for your needs                        */
+class ClientCallbacks : public NimBLEClientCallbacks {
+    void onConnect(NimBLEClient* pClient) override { TelnetPrint.printf("Connected\n"); }
+
+    void onDisconnect(NimBLEClient* pClient, int reason) override {
+        TelnetPrint.printf("%s Disconnected, reason = %d - Starting scan\n", pClient->getPeerAddress().toString().c_str(), reason);
+        NimBLEDevice::getScan()->start(bleScanTimeMs, false, true);
+    }
+
+    /********************* Security handled here *********************/
+    void onPassKeyEntry(NimBLEConnInfo& connInfo) override {
+        TelnetPrint.printf("Server Passkey Entry\n");
+        /**
+         * This should prompt the user to enter the passkey displayed
+         * on the peer device.
          */
-        //pClient->updateConnParams(120,120,0,60);
-    };
+        NimBLEDevice::injectPassKey(connInfo, 123456);
+    }
 
-    void onDisconnect(NimBLEClient* pClient) {
-        BLE_client_connected = false;
-        TelnetPrint.print(pClient->getPeerAddress().toString().c_str());
-        TelnetPrint.println(" Disconnected - Starting scan");
-        NimBLEDevice::getScan()->start(scanTime, scanEndedCB);
-    };
+    void onConfirmPasskey(NimBLEConnInfo& connInfo, uint32_t pass_key) override {
+        TelnetPrint.printf("The passkey YES/NO number: %" PRIu32 "\n", pass_key);
+        /** Inject false if passkeys don't match. */
+        NimBLEDevice::injectConfirmPasskey(connInfo, true);
+    }
 
-    /** Called when the peripheral requests a change to the connection parameters.
-     *  Return true to accept and apply them or false to reject and keep
-     *  the currently used parameters. Default will return true.
-     */
-     /*
-    bool onConnParamsUpdateRequest(NimBLEClient* pClient, const ble_gap_upd_params* params) {
-        if(params->itvl_min < 24) { // 1.25ms units
-            return false;
-        } else if(params->itvl_max > 40) { // 1.25ms units
-            return false;
-        } else if(params->latency > 2) { // Number of intervals allowed to skip
-            return false;
-        } else if(params->supervision_timeout > 100) { // 10ms units
-            return false;
-        }
-
-        return true;
-    };
-    */
-
-    /********************* Security handled here **********************
-    ****** Note: these are the same return values as defaults ********/
-    uint32_t onPassKeyRequest(){
-        TelnetPrint.println("Client Passkey Request");
-        /** return the passkey to send to the server */
-        return 123456;
-    };
-
-    bool onConfirmPIN(uint32_t pass_key){
-        TelnetPrint.print("The passkey YES/NO number: ");
-        TelnetPrint.println(pass_key);
-    /** Return false if passkeys don't match. */
-        return true;
-    };
-
-    /** Pairing process complete, we can check the results in ble_gap_conn_desc */
-    void onAuthenticationComplete(ble_gap_conn_desc* desc){
-        if(!desc->sec_state.encrypted) {
-            TelnetPrint.println("Encrypt connection failed - disconnecting");
-            /** Find the client with the connection handle provided in desc */
-            NimBLEDevice::getClientByID(desc->conn_handle)->disconnect();
+    /** Pairing process complete, we can check the results in connInfo */
+    void onAuthenticationComplete(NimBLEConnInfo& connInfo) override {
+        if (!connInfo.isEncrypted()) {
+            TelnetPrint.printf("Encrypt connection failed - disconnecting\n");
+            /** Find the client with the connection handle provided in connInfo */
+            NimBLEDevice::getClientByHandle(connInfo.getConnHandle())->disconnect();
             return;
         }
-    };
-};
+    }
+} clientCallbacks;
 
-void notifyCB(NimBLERemoteCharacteristic* pRemoteChar, uint8_t* pData, size_t length, bool isNotify){
-    bleCollectPacket((char *)pData, length);
-    /*
-    std::string str = (isNotify == true) ? "Notification" : "Indication";
-    str += " from ";
-    // NimBLEAddress and NimBLEUUID have std::string operators
-    str += std::string(pRemoteChar->getRemoteService()->getClient()->getPeerAddress());
-    str += ": Service = " + std::string(pRemoteChar->getRemoteService()->getUUID());
-    str += ", Characteristic = " + std::string(pRemoteChar->getUUID());
-    str += ", Value = " + std::string((char*)pData, length);
-    TelnetPrint.println(str.c_str());
-    */
-}
+/** Define a class to handle the callbacks when scan events are received */
+class ScanCallbacks : public NimBLEScanCallbacks {
+    void onResult(const NimBLEAdvertisedDevice* advertisedDevice) override {
+        TelnetPrint.printf("Advertised Device found: %s\n", advertisedDevice->toString().c_str());
+        if (advertisedDevice->isAdvertisingService(serviceUUID)) {
+            TelnetPrint.printf("Found Our Service\n");
+            /** stop scan before connecting */
+            NimBLEDevice::getScan()->stop();
+            /** Save the device reference in a global for the client to use*/
+            advDevice = advertisedDevice;
+            /** Ready to connect now */
+            doConnect = true;
+        }
+    }
+
+    /** Callback to process the results of the completed scan or restart it */
+    void onScanEnd(const NimBLEScanResults& results, int reason) override {
+        TelnetPrint.printf("Scan Ended, reason: %d, device count: %d\n", reason, results.getCount());
+        //TelnetPrint.printf("Restarting scan\n");
+        //NimBLEDevice::getScan()->start(bleScanTimeMs, false, true);
+    }
+} scanCallbacks;
+
 
 void bleRequestData()
 {
-#ifndef SIMULATION
-
     // If the flag "doConnect" is true then we have scanned for and found the desired
     // BLE Server with which we wish to connect.  Now we connect to it.  Once we are
     // connected we set the connected flag to be true.
-    if (doConnect == true)
-    {
-        if (connectToServer())
-        {
-            //commSerial.println("We are now connected to the BLE Server.");
-            TelnetPrint.println("We are now Connected in bleRequestData");
-            str_ble_status += getTimestamp() + " - Connected\n";
-            doConnect = false;
+    
+    if (!BLE_client_connected) {
+        doConnect = false;
+        /** Found a device we want to connect to, do it now */
+        if (connectToServer()) {
             BLE_client_connected = true;
+            str_ble_status += getTimestamp() + " - Connected\n";
+            TelnetPrint.printf("Success! we should now be getting notifications, scanning for more!\n");
+        } else {
+            TelnetPrint.printf("Failed to connect, starting scan\n");
+            NimBLEDevice::getScan()->start(bleScanTimeMs, false, true);
         }
     }
 
@@ -158,8 +119,8 @@ void bleRequestData()
     {
         TelnetPrint.println("BLE_client_connected ==true");
         unsigned long currentMillis = millis();
-        if ((currentMillis - previousMillis >= interval || newPacketReceived)) //every time period or when packet is received
-        {
+        //if ((currentMillis - previousMillis >= interval || newPacketReceived)) //every time period or when packet is received
+        //{
             previousMillis = currentMillis;
 
             if (toggle) //alternate info3 and info4
@@ -177,16 +138,73 @@ void bleRequestData()
                 newPacketReceived = false;
             }
             toggle = !toggle;
-        }
+        //}
     }
-    else if (doScan)
-    {
-      TelnetPrint.println("doScan");
-      BLEDevice::getScan()->start(0); // this is just example to start scan after disconnect, most likely there is better way to do it in arduino
-    }
-#endif
+    //else if (doScan)
+    //{
+    //  TelnetPrint.println("doScan");
+    //  BLEDevice::getScan()->start(0); // this is just example to start scan after disconnect, most likely there is better way to do it in arduino
+    //}
 }
 
+void initBle() {
+    TelnetPrint.printf("Starting NimBLE Async Client\n");
+    /*
+    NimBLEDevice::init("Async-Client");
+    NimBLEDevice::setPower(3);  // +3db
+
+    NimBLEScan* pScan = NimBLEDevice::getScan();
+    pScan->setScanCallbacks(&scanCallbacks, false);
+    pScan->setInterval(45);
+    pScan->setWindow(45);
+    pScan->setActiveScan(true);
+    pScan->start(bleScanTimeMs);
+    */
+
+    /** Initialize NimBLE and set the device name */
+    NimBLEDevice::init("NimBLE-Client");
+
+    /**
+     * Set the IO capabilities of the device, each option will trigger a different pairing method.
+     *  BLE_HS_IO_KEYBOARD_ONLY   - Passkey pairing
+     *  BLE_HS_IO_DISPLAY_YESNO   - Numeric comparison pairing
+     *  BLE_HS_IO_NO_INPUT_OUTPUT - DEFAULT setting - just works pairing
+     */
+    // NimBLEDevice::setSecurityIOCap(BLE_HS_IO_KEYBOARD_ONLY); // use passkey
+    // NimBLEDevice::setSecurityIOCap(BLE_HS_IO_DISPLAY_YESNO); //use numeric comparison
+
+    /**
+     * 2 different ways to set security - both calls achieve the same result.
+     *  no bonding, no man in the middle protection, BLE secure connections.
+     *  These are the default values, only shown here for demonstration.
+     */
+    // NimBLEDevice::setSecurityAuth(false, false, true);
+
+    //NimBLEDevice::setSecurityAuth(/*BLE_SM_PAIR_AUTHREQ_BOND | BLE_SM_PAIR_AUTHREQ_MITM |*/ BLE_SM_PAIR_AUTHREQ_SC);
+
+    /** Optional: set the transmit power */
+    NimBLEDevice::setPower(3); /** 3dbm */
+    NimBLEScan* pScan = NimBLEDevice::getScan();
+
+    /** Set the callbacks to call when scan events occur, no duplicates */
+    pScan->setScanCallbacks(&scanCallbacks, false);
+
+    /** Set scan interval (how often) and window (how long) in milliseconds */
+    pScan->setInterval(45);
+    pScan->setWindow(45);
+
+    /**
+     * Active scan will gather scan response data from advertisers
+     *  but will use more energy from both devices
+     */
+    pScan->setActiveScan(true);
+
+    /** Start scanning for advertisers */
+    pScan->start(bleScanTimeMs);
+    TelnetPrint.printf("Scanning for peripherals\n");
+}
+
+/*
 void bleStartup()
 {
 #ifndef SIMULATION
@@ -216,7 +234,7 @@ void bleStartup()
     //pBLEScan->setInterval(1349);
     //pBLEScan->setWindow(449);
 
-    /** Set scan interval (how often) and window (how long) in milliseconds */
+    // Set scan interval (how often) and window (how long) in milliseconds
     pBLEScan->setInterval(1500);
     pBLEScan->setWindow(500);
 
@@ -226,7 +244,7 @@ void bleStartup()
 #endif
 }
 
-/** Define a class to handle the callbacks when advertisments are received */
+// Define a class to handle the callbacks when advertisments are received
 class AdvertisedDeviceCallbacks: public NimBLEAdvertisedDeviceCallbacks {
 
     void onResult(NimBLEAdvertisedDevice* advertisedDevice) {
@@ -235,15 +253,16 @@ class AdvertisedDeviceCallbacks: public NimBLEAdvertisedDeviceCallbacks {
         if(advertisedDevice->isAdvertisingService(serviceUUID))
         {
             TelnetPrint.println("Found Our Service");
-            /** stop scan before connecting */
+            // stop scan before connecting
             NimBLEDevice::getScan()->stop();
-            /** Save the device reference in a global for the client to use*/
+            // Save the device reference in a global for the client to use
             myDevice = advertisedDevice;
-            /** Ready to connect now */
+            // Ready to connect now
             doConnect = true;
         }
     };
 };
+*/
 
 /** Notification / Indication receiving handler callback */
 static void notifyCallbackTwo(BLERemoteCharacteristic* pBLERemoteCharacteristic, uint8_t* pData, size_t length,bool isNotify) {
@@ -254,98 +273,209 @@ static void notifyCallbackTwo(BLERemoteCharacteristic* pBLERemoteCharacteristic,
   bleCollectPacket((char *)pData, length);
 }
 
-bool connectToServer()
-{
-    TRACE;
-    //commSerial.print("Forming a connection to ");
-    //commSerial.println(advDevice->getAddress().toString().c_str());
-    pClientOld = NimBLEDevice::createClient();
-    TelnetPrint.println("New client created");
+/** Handles the provisioning of clients and connects / interfaces with the server */
+bool connectToServer() {
+    NimBLEClient* pClient = nullptr;
 
-    TelnetPrint.println("setClientCallbacks");
-    delay(100);
-    pClientOld->setClientCallbacks(new MyClientCallback());
-    //pClientOld->setClientCallbacks(new ClientCallbacks());
-
-    /** Set initial connection parameters: These settings are 15ms interval, 0 latency, 120ms timout.
-      *  These settings are safe for 3 clients to connect reliably, can go faster if you have less
-      *  connections. Timeout should be a multiple of the interval, minimum is 100ms.
-      *  Min interval: 12 * 1.25ms = 15, Max interval: 12 * 1.25ms = 15, 0 latency, 51 * 10ms = 510ms timeout
-      */
-    TelnetPrint.println("setConnectionParams");
-    pClientOld->setConnectionParams(12,12,0,51);
-    /** Set how long we are willing to wait for the connection to complete (seconds), default is 30. */
-    TelnetPrint.println("setConnectTimeout");
-    pClientOld->setConnectTimeout(5);
-
-    TelnetPrint.println("Checking some things...");
-    if(myDevice == nullptr) {
-      TelnetPrint.println("myDevice == nullptr");
-      return false;
-    }
-    // Connect to the remote BLE Server.
-    if(pClientOld->isConnected()) {
-      TelnetPrint.println("pClientOld->isConnected()");
-    } else {
-      TelnetPrint.println("pClientOld->connect");
-      if (!pClientOld->connect(myDevice)) { // if you pass BLEAdvertisedDevice instead of address, it will be recognized type of peer device address (public or private)      
-        TelnetPrint.println("Failed to connect");
-        return false;
-      }
-    }
-
-    // Obtain a reference to the service we are after in the remote BLE server.
-    TelnetPrint.println("pClientOld->getService");
-    pRemoteService = pClientOld->getService(serviceUUID);
-    if (pRemoteService == nullptr)
-    {
-        TelnetPrint.println("pClientOld->disconnect");
-        pClientOld->disconnect();
-        return false;
-    }
-
-    // Obtain a reference to the characteristic in the service of the remote BLE server.
-    TelnetPrint.println("pClientOld->getCharacteristic");
-    pRemoteCharacteristic = pRemoteService->getCharacteristic(charUUID_rx);
-    if (pRemoteCharacteristic == nullptr)
-    {
-        TelnetPrint.print("Failed to find our characteristic UUID: ");
-        TelnetPrint.println(charUUID_rx.toString().c_str());
-        pClientOld->disconnect();
-        return false;
-    }
-
-    TelnetPrint.println("pRemoteCharacteristic->canRead");
-    // Read the value of the characteristic.
-    if (pRemoteCharacteristic->canRead())
-    {
-        std::string value = pRemoteCharacteristic->readValue();
-    }
-
-    TelnetPrint.println("pRemoteCharacteristic->canNotify");
-    if (pRemoteCharacteristic->canNotify()) {
-        TelnetPrint.println("pRemoteCharacteristic->subscribe");
-        if(pRemoteCharacteristic->subscribe(true, notifyCallbackTwo, true)) {
-          TelnetPrint.println("client_connected");
-          BLE_client_connected = true;
+    /** Check if we have a client we should reuse first **/
+    if (NimBLEDevice::getCreatedClientCount()) {
+        /**
+         *  Special case when we already know this device, we send false as the
+         *  second argument in connect() to prevent refreshing the service database.
+         *  This saves considerable time and power.
+         */
+        if (!advDevice) {
+            TelnetPrint.printf("Special - No advDevice\n");
+            return false;          
+        }
+        pClient = NimBLEDevice::getClientByPeerAddress(advDevice->getAddress());
+        if (pClient) {
+            if (!pClient->connect(advDevice, false)) {
+                TelnetPrint.printf("Reconnect failed\n");
+                return false;
+            }
+            TelnetPrint.printf("Reconnected client\n");
         } else {
-          TelnetPrint.println("Failed to subscribe");
+            /**
+             *  We don't already have a client that knows this device,
+             *  check for a client that is disconnected that we can use.
+             */
+            pClient = NimBLEDevice::getDisconnectedClient();
+        }
+    }
+
+    /** No client to reuse? Create a new one. */
+    if (!pClient) {
+        if (NimBLEDevice::getCreatedClientCount() >= NIMBLE_MAX_CONNECTIONS) {
+            TelnetPrint.printf("Max clients reached - no more connections available\n");
+            return false;
+        }
+
+        pClient = NimBLEDevice::createClient();
+
+        TelnetPrint.printf("New client created\n");
+
+        pClient->setClientCallbacks(&clientCallbacks, false);
+        /**
+         *  Set initial connection parameters:
+         *  These settings are safe for 3 clients to connect reliably, can go faster if you have less
+         *  connections. Timeout should be a multiple of the interval, minimum is 100ms.
+         *  Min interval: 12 * 1.25ms = 15, Max interval: 12 * 1.25ms = 15, 0 latency, 150 * 10ms = 1500ms timeout
+         */
+        pClient->setConnectionParams(12, 12, 0, 150);
+
+        /** Set how long we are willing to wait for the connection to complete (milliseconds), default is 30000. */
+        pClient->setConnectTimeout(5 * 1000);
+
+        if (!advDevice) {
+            TelnetPrint.printf("No advDevice\n");
+            return false;
+        }
+        if (!pClient->connect(advDevice)) {
+            /** Created a client but failed to connect, don't need to keep it as it has no data */
+            NimBLEDevice::deleteClient(pClient);
+            TelnetPrint.printf("Failed to connect, deleted client\n");
+            return false;
+        }
+    }
+
+    if (!pClient->isConnected()) {
+        if (!advDevice) {
+            TelnetPrint.printf("No advDevice\n");
+            return false;
+        }
+        if (!pClient->connect(advDevice)) {
+            TelnetPrint.printf("Failed to connect\n");
+            return false;
+        }
+    }
+
+    TelnetPrint.printf("Connected to: %s RSSI: %d\n", pClient->getPeerAddress().toString().c_str(), pClient->getRssi());
+
+    /** Now we can read/write/subscribe the characteristics of the services we are interested in */
+    //NimBLERemoteService*        pSvc = nullptr;
+    NimBLERemoteCharacteristic* pChr = nullptr;
+    NimBLERemoteDescriptor*     pDsc = nullptr;
+
+    pRemoteService = pClient->getService(serviceUUID);
+    if (pRemoteService) {
+        pChr = pRemoteService->getCharacteristic(charUUID_rx);
+    }
+
+    if (pChr) {
+        if (pChr->canRead()) {
+            TelnetPrint.printf("%s Value: %s\n", pChr->getUUID().toString().c_str(), pChr->readValue().c_str());
+        }
+        TelnetPrint.printf("Asdf\n");
+        /*
+        if (pChr->canWrite()) {
+            if (pChr->writeValue("Tasty")) {
+                TelnetPrint.printf("Wrote new value to: %s\n", pChr->getUUID().toString().c_str());
+            } else {
+                pClient->disconnect();
+                return false;
+            }
+
+            if (pChr->canRead()) {
+                TelnetPrint.printf("The value of: %s is now: %s\n", pChr->getUUID().toString().c_str(), pChr->readValue().c_str());
+            }
+        }
+        */
+        pChr->subscribe(true, notifyCallbackTwo);
+        pChr->subscribe(false, notifyCallbackTwo);
+/*
+        if (pChr->canNotify()) {
+            if (!pChr->subscribe(true, notifyCB)) {
+                pClient->disconnect();
+                return false;
+            }
+        } else if (pChr->canIndicate()) {
+            // Send false as first argument to subscribe to indications instead of notifications
+            if (!pChr->subscribe(false, notifyCB)) {
+                pClient->disconnect();
+                return false;
+            }
+        }
+        */
+    } else {
+        TelnetPrint.printf("DEAD service not found.\n");
+    }
+
+/*
+    pSvc = pClient->getService("BAAD");
+    if (pSvc) {
+        pChr = pSvc->getCharacteristic("F00D");
+        if (pChr) {
+            if (pChr->canRead()) {
+                TelnetPrint.printf("%s Value: %s\n", pChr->getUUID().toString().c_str(), pChr->readValue().c_str());
+            }
+
+            pDsc = pChr->getDescriptor(NimBLEUUID("C01D"));
+            if (pDsc) {
+                TelnetPrint.printf("Descriptor: %s  Value: %s\n", pDsc->getUUID().toString().c_str(), pDsc->readValue().c_str());
+            }
+
+            if (pChr->canWrite()) {
+                if (pChr->writeValue("No tip!")) {
+                    TelnetPrint.printf("Wrote new value to: %s\n", pChr->getUUID().toString().c_str());
+                } else {
+                    pClient->disconnect();
+                    return false;
+                }
+
+                if (pChr->canRead()) {
+                    TelnetPrint.printf("The value of: %s is now: %s\n",
+                                  pChr->getUUID().toString().c_str(),
+                                  pChr->readValue().c_str());
+                }
+            }
+
+            if (pChr->canNotify()) {
+                if (!pChr->subscribe(true, notifyCB)) {
+                    pClient->disconnect();
+                    return false;
+                }
+            } else if (pChr->canIndicate()) {
+                // Send false as first argument to subscribe to indications instead of notifications
+                if (!pChr->subscribe(false, notifyCB)) {
+                    pClient->disconnect();
+                    return false;
+                }
+            }
         }
     } else {
-      TelnetPrint.println("Cannot subscribe to rx characteristic");
+        TelnetPrint.printf("BAAD service not found.\n");
     }
-
-    return BLE_client_connected;
+*/
+    TelnetPrint.printf("Done with this device!\n");
+    return true;
 }
 
 void sendCommand(uint8_t *data, size_t dataLen)
 {
-  TRACE;
   //https://github.com/FurTrader/OverkillSolarBMS/blob/master/Comm_Protocol_Documentation/BLE%20_bluetooth_protocol.md#executive-summary
   //TelnetPrint.print("Characteristics: ");
   //TelnetPrint.println(pRemoteService->toString().c_str());
-  BLERemoteCharacteristic *pRemoteCharacteristic_overkill;
+  if(pRemoteService) {
+    if(!pRemoteCharacteristic_overkill) {
+      pRemoteCharacteristic_overkill = pRemoteService->getCharacteristic(charUUID_tx);
+    }
 
+    if (pRemoteCharacteristic_overkill) {
+      TelnetPrint.println(getTimestamp() + " Write to Regular");
+      if(!pRemoteCharacteristic_overkill->writeValue(data, dataLen, false)) {
+        TelnetPrint.println("Unable to send command");
+      }
+    } else {
+      str_ble_status += "Remote TX characteristic not found\n";
+      TelnetPrint.println("Remote TX characteristic not found");
+    }
+  } else {
+    str_ble_status += "pRemoteService is nullptr\n";
+    TelnetPrint.println("pRemoteService is nullptr");    
+  }
+ 
+/*
   pRemoteCharacteristic_overkill = pRemoteService->getCharacteristic(charUUID_tx);
   if (pRemoteCharacteristic_overkill)
   {
@@ -359,4 +489,15 @@ void sendCommand(uint8_t *data, size_t dataLen)
     str_ble_status += "Remote TX characteristic not found\n";
     TelnetPrint.println("Remote TX characteristic not found");
   }
+*/
+}
+
+void bleDisconnect() {
+    pRemoteService = nullptr;
+    pRemoteCharacteristic_overkill = nullptr;
+    auto pClients = NimBLEDevice::getConnectedClients();
+    for (auto& pClient : pClients) {
+        TelnetPrint.printf("%s\n", pClient->toString().c_str());
+        NimBLEDevice::deleteClient(pClient);
+    }
 }
