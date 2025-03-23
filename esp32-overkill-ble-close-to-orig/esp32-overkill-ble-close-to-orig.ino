@@ -249,10 +249,15 @@ String reportingUrl_str = "http://192.168.10.61:3000/dev/solar";
 
 
 unsigned long currentMillis = 0;
+unsigned long lastSuccessfulBluetooth = 0;
 // the following variables are unsigned longs because the time, measured in
 // milliseconds, will quickly become a bigger number than can be stored in an int.
 unsigned long lastTime = 0;
 unsigned long lastWebTime = 0;
+
+
+// Watchdog set for 5 minutes
+unsigned long bluetoothWatchdogMS = 300000;
 
 // Timer set to 10 minutes (600000)
 //unsigned long timerDelayMS = 600000;
@@ -666,7 +671,8 @@ String structToString() {
         asdf += "\"latest_hashrate_" + String(x) + "\": " + String(latest_hashrates[x], 3) + ",";
       }
     }
-    asdf += "\"controller_connected\": " + String(BLE_client_connected);
+    bool isConnected = BLE_client_connected && ((millis() - lastSuccessfulBluetooth) < bluetoothWatchdogMS);
+    asdf += "\"controller_connected\": " + String(isConnected);
 
     asdf += "}";
     return asdf;
@@ -755,6 +761,7 @@ String statsIndex() {
   data += "<p>Automatics: " + String(allow_auto ? "On" : "Off") + "</p>";
   data += automatic_decisions.html(true);
 
+  data += "<p>Current Time: " + getTimestamp() + "</p>";
   data += "<p>Last BMS Data Capture: " + last_data_capture_bms + "</p>";
   data += "<p>Last SCC Data Capture: " + last_data_capture_scc + "</p>";
   if (current_status != "") {
@@ -1171,8 +1178,8 @@ String getTimestamp() {
 }
 
 void update_decisions(bool allow_automatic) {
-  AppendStatus("Current Time: " + getTimestamp());
   if (!BLE_client_connected) {
+    AppendStatus("Current Time: " + getTimestamp());
     AppendStatus("BLE Controller is not connected. No decisions will be made");
     return;
   }
@@ -1350,30 +1357,50 @@ void update_decisions(bool allow_automatic) {
   //float ah_left_to_charge = ((batt_cap_ah*1.0) - ((batt_cap_ah*1.0) * (renogy_data.battery_soc / 100)));
 }
 
+bool loopOneTime = false;
 void loop() {
+  // I think this just has to run all the time?
+  tracer.update();
   if (first_loop) {
     TelnetPrint.println("Entering loop");
     TelnetPrint.println("Entering loop...");
   }
 
   currentMillis = millis();
+  // ten minutes
+  if ((currentMillis - lastSuccessfulBluetooth) > bluetoothWatchdogMS && !first_loop) {
+    TelnetPrint.println("Bluetooth Watchdog - Disconnect");
+    bleDisconnect();
+    TelnetPrint.println("Bluetooth Watchdog - Delay");
+    delay(500);
+    TelnetPrint.println("Bluetooth Watchdog - Connect");
+    if(connectToServer()) {
+      lastSuccessfulBluetooth = millis();
+    } else {
+      delay(5000);
+    }
+  }
   // Only read info every 10th loop
   if ((currentMillis - lastTime) > timerDelayMS || first_loop) {
+    loopOneTime = true;
     TelnetPrint.println("Updating data");
     status_str = "";
     stat_char[0] = '\0';
     bleRequestData();
+    delay(250);
     
     if(requestFromEPEver()) {
       last_data_capture_scc = getTimestamp();
     }
     //if(!sendRequestToAstro()) {
+    /*
     if(!first_loop) {
       for(int x = 0; x < NUM_DEVICES && device_pins[x] != 0; x++) {
         //sendRequestToLuna(x, "192.168.30.156", 44001);
         sendRequestToLuna(x, device_ips[x], device_ports[x]);
       }
     }
+    */
     
     //}
 
@@ -1403,9 +1430,12 @@ void loop() {
 
   //Send an HTTP POST request every 10 minutes
   if ((currentMillis - lastWebTime) > timerWebDelayMS) {
-    AppendStatus("Will POST HTTP");
-    TelnetPrint.println("HTTP POST...");
-    str_http_status = "Will POST HTTP @ " + getTimestamp() + "\n";
+    //AppendStatus("Will POST HTTP");
+    if(loopOneTime) {
+      TelnetPrint.println("HTTP POST...");
+      str_http_status = "Will POST HTTP @ " + getTimestamp() + "\n";
+      loopOneTime = false;
+    }
     //Check WiFi connection status
     if (WiFi.status() == WL_CONNECTED) {
       if (BLE_client_connected) {
@@ -1435,19 +1465,25 @@ void loop() {
         //int httpResponseCode = 200;
 
         TelnetPrint.println("HTTP Response code: " + String(httpResponseCode));
-        AppendStatus("Latest Posting Reponse Code: " + String(httpResponseCode));
+        //AppendStatus("Latest Posting Reponse Code: " + String(httpResponseCode));
         str_http_status += "Latest Posting Reponse Code: " + String(httpResponseCode);
 
         // Free resources
         theHttpClient.end();
         lastWebTime = millis();
       } else {
-        AppendStatus("Latest Posting Reponse: No BLE");
-        str_http_status += "Lastest Posting Response: No BLE";
+        //AppendStatus("Latest Posting Reponse: No BLE");
+        if(loopOneTime) {
+          str_http_status += "Lastest Posting Response: No BLE";
+          loopOneTime = false;
+        }
       }
     } else {
-      AppendStatus("Latest Posting Reponse: No WiFi");
-      str_http_status += "Lastest Posting Response: No WiFi";
+      if(loopOneTime) {
+        //AppendStatus("Latest Posting Reponse: No WiFi");
+        str_http_status += "Lastest Posting Response: No WiFi";
+        loopOneTime = false;
+      }
     }
   }
 
@@ -1461,9 +1497,9 @@ void loop() {
   }
   */
   // I think this just has to run all the time?
-  tracer.update();
+  //tracer.update();
 
-  getMeasuredUsage();
+  //getMeasuredUsage();
 }
 
 
@@ -1683,6 +1719,7 @@ void renogy_control_load(bool state, int pin) {
   //else node.writeSingleRegister(0x010A, 0);  // turn off load
 }
 
+/*
 bool sendRequestToAstro(int device_index) {
   TelnetPrint.println("Requesting Astro");
   bool toRet = false;
@@ -1708,7 +1745,7 @@ bool sendRequestToAstro(int device_index) {
       //TelnetPrint.println(str);
       str_http_status += str;
 
-      /*
+      /
       String json = "{" + str + "}";
       StaticJsonDocument<200> doc;
       // Deserialize the JSON document
@@ -1732,7 +1769,7 @@ bool sendRequestToAstro(int device_index) {
         TelnetPrint.print("Latest hashrate json: ");
         TelnetPrint.println(hashrate);
       }
-      */
+      /
       if(str != "") {
         // "algo":"astrobwt","ar":"[119,0]","fan":"[0]","hs":"[1.142244]","hs_units":"khs","uptime":273,"ver":"1.9.2.R4"
         str.replace("hs", "X");
@@ -1749,7 +1786,7 @@ bool sendRequestToAstro(int device_index) {
         TelnetPrint.println(hashrate);
       }
     } else {
-      TelnetPrint.print("Response not ready yet");
+      TelnetPrint.println("Response not ready yet");
     }
   }
   //localClient.close();
@@ -1757,7 +1794,8 @@ bool sendRequestToAstro(int device_index) {
 }
 
 bool sendRequestToLuna(int device_index, String ip, const uint port) {
-  TelnetPrint.println("Requesting Luna");
+  TelnetPrint.print("Requesting Luna: ");
+  TelnetPrint.println(ip);
   bool toRet = false;
   WiFiClient localClient;
   //const uint port = 44001;
@@ -1803,12 +1841,14 @@ bool sendRequestToLuna(int device_index, String ip, const uint port) {
       TelnetPrint.println("Last line is blank. :(");
     }
   } else {
-    TelnetPrint.print("Response not ready yet");
+    TelnetPrint.println("Response not ready yet");
   }
+  localClient.flush();
+  localClient.stop();
   
   return toRet;
 }
-
+*/
 bool requestFromEPEver() {
   //float rssi = WiFi.RSSI();
   //TelnetPrint.print("WiFi signal strength is: "); TelnetPrint.println(rssi);

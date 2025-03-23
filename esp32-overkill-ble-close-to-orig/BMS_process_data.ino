@@ -237,6 +237,7 @@ bool bleCollectPacket(char *data, uint32_t dataSize) // reconstruct packet from 
         bmsProcessPacket(packet); //pass pointer to retrieved packet to processing function
         packetstate = 0;
         retVal = true;
+        lastSuccessfulBluetooth = millis();
     }
     return retVal;
 }
